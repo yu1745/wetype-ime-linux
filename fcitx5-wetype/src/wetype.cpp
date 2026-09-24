@@ -45,8 +45,11 @@ namespace fcitx {
 
 static constexpr int GRID_ROWS = 4;
 static constexpr int GRID_COLUMNS = 5;
-static constexpr int COMPACT_PAGE_SIZE = GRID_COLUMNS;
+// Compact bar is one horizontal row. It is not tied to the expanded grid.
+static constexpr int COMPACT_PAGE_SIZE = 7;
 static constexpr int PAGE_SIZE = GRID_ROWS * GRID_COLUMNS;
+// Same line box as a CJK candidate, so the panel does not grow when words arrive.
+static const char *const CANDIDATE_ROW_PAD = "\u3000";
 static constexpr uint64_t CANDIDATE_DEBOUNCE_USEC = 40000;
 static constexpr size_t CANDIDATE_DEBOUNCE_MAX_CHARS = 4;
 
@@ -447,28 +450,44 @@ private:
                 selected_ = 0;
             }
         }
-        if (!cands_.empty()) {
+        // Keep the candidate row from the first pinyin key. Kimpanel places the
+        // panel below the cursor while it is only as tall as the preedit, then
+        // flips it above once the row appears near the bottom of the screen.
+        if (!buf_.empty() || !cands_.empty()) {
             const int start = windowStart_;
-            const int visiblePageSize = expandedGrid_ ? PAGE_SIZE : COMPACT_PAGE_SIZE;
-            const int end = std::min<int>(start + visiblePageSize, cands_.size());
-            const int pageCount = end - start;
-            if (selected_ < start || selected_ >= end) selected_ = start;
+            const bool compact = !expandedGrid_ || cands_.empty();
+            const int visiblePageSize = compact ? COMPACT_PAGE_SIZE : PAGE_SIZE;
+            const int realCount = cands_.empty()
+                                      ? 0
+                                      : std::min(visiblePageSize,
+                                                 static_cast<int>(cands_.size()) - start);
+            if (realCount > 0 &&
+                (selected_ < start || selected_ >= start + realCount)) {
+                selected_ = start;
+            }
             auto cl = std::make_unique<CommonCandidateList>();
             cl->setLayoutHint(CandidateLayoutHint::Horizontal);
-            if (!expandedGrid_) {
-                cl->setPageSize(pageCount);
-                for (int index = start; index < end; ++index) {
+            if (compact) {
+                cl->setPageSize(COMPACT_PAGE_SIZE);
+                for (int slot = 0; slot < COMPACT_PAGE_SIZE; ++slot) {
+                    const int index = start + slot;
                     Text candidate;
-                    candidate.append(std::to_string(index - start + 1) + " ");
-                    candidate.append(cands_[index]);
-                    cl->append<GridColumnCandidate>(std::move(candidate),
-                        [this, index](InputContext *context) {
-                            commitCandidate(context, index);
-                        });
+                    if (slot < realCount) {
+                        candidate.append(std::to_string(slot + 1) + " ");
+                        candidate.append(cands_[index]);
+                        cl->append<GridColumnCandidate>(std::move(candidate),
+                            [this, index](InputContext *context) {
+                                commitCandidate(context, index);
+                            });
+                    } else {
+                        candidate.append(CANDIDATE_ROW_PAD);
+                        cl->append<GridColumnCandidate>(std::move(candidate),
+                            [](InputContext *) {});
+                    }
                 }
                 // The API validates this index immediately against the list
                 // size, so set it only after all compact candidates exist.
-                cl->setGlobalCursorIndex(selected_ - start);
+                cl->setGlobalCursorIndex(realCount > 0 ? selected_ - start : -1);
             } else {
                 cl->setPageSize(GRID_COLUMNS);
                 cl->setLabels(std::vector<std::string>(GRID_COLUMNS, ""));
@@ -477,7 +496,7 @@ private:
                     Text column;
                     for (int row = 0; row < GRID_ROWS; ++row) {
                         const int index = start + row * GRID_COLUMNS + col;
-                        if (index < end) {
+                        if (index < start + realCount) {
                             const bool selected = index == selected_;
                             const auto label = std::to_string(index - start + 1) + " ";
                             const auto flag = selected ? TextFormatFlag::HighLight
