@@ -38,14 +38,21 @@ chmod +x "$ENG/wetype-ime-demo.sh"
 
 # 1b. 第三方运行时：静态 QEMU user 模式 + 最小 ARM64 glibc（均可再分发，见 THIRD-PARTY）
 QEMU_BIN="${QEMU_AARCH64:-$(command -v qemu-aarch64-static || true)}"
-SYSROOT_SRC="${WETYPE_SYSROOT:-/usr/aarch64-linux-gnu}"
+if [ "$(uname -m)" = aarch64 ]; then
+  DEFAULT_SYSROOT=/lib/aarch64-linux-gnu
+else
+  DEFAULT_SYSROOT=/usr/aarch64-linux-gnu/lib
+fi
+SYSROOT_LIB="${WETYPE_SYSROOT:-$DEFAULT_SYSROOT}"
+# WETYPE_SYSROOT may point either to a sysroot or directly to its lib directory.
+if [ -d "$SYSROOT_LIB/lib" ]; then SYSROOT_LIB="$SYSROOT_LIB/lib"; fi
 [ -n "$QEMU_BIN" ] && [ -x "$QEMU_BIN" ] || { echo "Missing qemu-aarch64-static (qemu-user-static)" >&2; exit 1; }
 file -L "$QEMU_BIN" | grep -q 'static' || { echo "$QEMU_BIN is not statically linked" >&2; exit 1; }
 cp -L "$QEMU_BIN" "$ENG/qemu-aarch64-static"
 mkdir -p "$ENG/sysroot/lib"
 for so in ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0; do
-  [ -f "$SYSROOT_SRC/lib/$so" ] || { echo "Missing ARM64 glibc: $SYSROOT_SRC/lib/$so (libc6-arm64-cross)" >&2; exit 1; }
-  cp -L "$SYSROOT_SRC/lib/$so" "$ENG/sysroot/lib/"
+  [ -f "$SYSROOT_LIB/$so" ] || { echo "Missing ARM64 glibc: $SYSROOT_LIB/$so" >&2; exit 1; }
+  cp -L "$SYSROOT_LIB/$so" "$ENG/sysroot/lib/"
 done
 pkg_version() { dpkg-query -W -f '${Version}' "$1" 2>/dev/null || echo unknown; }
 mkdir -p "$APPDIR/usr/share/doc/wetype-ime"

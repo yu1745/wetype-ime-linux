@@ -4,7 +4,7 @@ T=$(mktemp -d /tmp/wetype-e2e.XXXXXX)
 trap 'rm -rf "$T"' EXIT
 BASE="$(cd "$(dirname "$0")/../.." && pwd)"
 ENGD="$BASE/squashfs-root/usr/lib/wetype-ime/arm64"
-if [ ! -d "$ENGD" ]; then echo "缺引擎目录: 先 bash scripts/e2_img.sh && ./WeTypeIME-Engine-x86_64.AppImage --appimage-extract"; exit 9; fi
+if [ ! -d "$ENGD" ]; then echo "缺引擎目录: 先 bash scripts/e2_img.sh && ./WeTypeIME-Engine-$(uname -m).AppImage --appimage-extract"; exit 9; fi
 MODE="${1:-test}"
 
 rm -rf "$T/config" "$T/data" "$T/bus"
