@@ -12,46 +12,80 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build dependencies
         run: |
-          # The runner's third-party apt sources would fail on arm64 indexes; the build does not need them.
-          sudo rm -f /etc/apt/sources.list.d/*.list
-          # Ubuntu serves arm64 packages from ports.ubuntu.com only.
-          sudo sed -i '/^Types:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
-          printf '%s\n' 'Types: deb' 'URIs: http://ports.ubuntu.com/ubuntu-ports' \
-            'Suites: noble noble-updates noble-security' 'Components: main universe' \
-            'Architectures: arm64' 'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' |
-            sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources >/dev/null
-          sudo dpkg --add-architecture arm64
+          if [ "${{ matrix.arch }}" = x86_64 ]; then
+            # Ubuntu serves arm64 packages from ports.ubuntu.com only.
+            sudo rm -f /etc/apt/sources.list.d/*.list
+            sudo sed -i '/^Types:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+            printf '%s\n' 'Types: deb' 'URIs: http://ports.ubuntu.com/ubuntu-ports' \
+              'Suites: noble noble-updates noble-security' 'Components: main universe' \
+              'Architectures: arm64' 'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' |
+              sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources >/dev/null
+            sudo dpkg --add-architecture arm64
+          fi
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake libfcitx5core-dev patchelf binutils file \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu qemu-user-static libc6-arm64-cross \
-            zlib1g:arm64 python3 unzip curl ca-certificates
+            qemu-user-static python3 unzip curl ca-certificates
+          if [ "${{ matrix.arch }}" = x86_64 ]; then
+            sudo apt-get install -y --no-install-recommends \
+              gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-arm64-cross zlib1g:arm64
+          else
+            sudo apt-get install -y --no-install-recommends zlib1g
+          fi
 
       - name: Build AppImage
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'   # no FUSE on the runner
         run: |
           scripts/e2_img.sh
-          sha256sum WeTypeIME-Engine-x86_64.AppImage > WeTypeIME-Engine-x86_64.AppImage.sha256
-          cat WeTypeIME-Engine-x86_64.AppImage.sha256
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          readelf -h AppDir/usr/lib/wetype-ime/arm64/wetype-harness | grep -q 'Machine:.*AArch64'
+          if [ '${{ matrix.arch }}' = aarch64 ]; then
+            readelf -h AppDir/usr/lib/fcitx5/libfcitx5-wetype.so | grep -q 'Machine:.*AArch64'
+            readelf -h AppDir/usr/lib/wetype-ime/arm64/qemu-aarch64-static | grep -q 'Machine:.*AArch64'
+            readelf -h WeTypeIME-Engine-aarch64.AppImage | grep -q 'Machine:.*AArch64'
+          else
+            readelf -h AppDir/usr/lib/fcitx5/libfcitx5-wetype.so | grep -q 'Machine:.*X86-64'
+            readelf -h AppDir/usr/lib/wetype-ime/arm64/qemu-aarch64-static | grep -q 'Machine:.*X86-64'
+            readelf -h WeTypeIME-Engine-x86_64.AppImage | grep -q 'Machine:.*X86-64'
+          fi
+          sha256sum "WeTypeIME-Engine-${{ matrix.arch }}.AppImage" > "WeTypeIME-Engine-${{ matrix.arch }}.AppImage.sha256"
+          cat "WeTypeIME-Engine-${{ matrix.arch }}.AppImage.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: WeTypeIME-Engine-x86_64
+          name: WeTypeIME-Engine-${{ matrix.arch }}
           path: |
-            WeTypeIME-Engine-x86_64.AppImage
-            WeTypeIME-Engine-x86_64.AppImage.sha256
+            WeTypeIME-Engine-${{ matrix.arch }}.AppImage
+            WeTypeIME-Engine-${{ matrix.arch }}.AppImage.sha256
 
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: WeTypeIME-Engine-*
+          merge-multiple: true
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
-            WeTypeIME-Engine-x86_64.AppImage WeTypeIME-Engine-x86_64.AppImage.sha256
+            WeTypeIME-Engine-*.AppImage WeTypeIME-Engine-*.AppImage.sha256

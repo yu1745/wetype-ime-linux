@@ -1,6 +1,6 @@
 # WeType Linux
 
-在 Linux 上通过 Fcitx 5 使用微信输入法（WeType）引擎。引擎是 Android ARM64 版本，由 QEMU user 模式运行。
+在 x86_64 和 ARM64 Linux 上通过 Fcitx 5 使用微信输入法（WeType）引擎。引擎是 Android ARM64 版本，在两种主机上均由 QEMU user 模式运行。
 
 > **非官方项目**，与腾讯无关，也未获其认可。WeType、微信输入法、微信是腾讯的商标。使用 WeType 引擎须遵守腾讯的相关条款。
 
@@ -19,7 +19,7 @@ sudo pacman -S --needed python patchelf unzip curl    # Arch
 然后运行：
 
 ```sh
-./WeTypeIME-Engine-x86_64.AppImage install            # 安装到 ~/.local；用 sudo 则安装到 /usr
+./WeTypeIME-Engine-$(uname -m).AppImage install       # 安装到 ~/.local；用 sudo 则安装到 /usr
 ```
 
 安装完成后重启 Fcitx5，并在输入法配置中添加“微信拼音”。
@@ -27,16 +27,16 @@ sudo pacman -S --needed python patchelf unzip curl    # Arch
 其他命令：
 
 ```sh
-./WeTypeIME-Engine-x86_64.AppImage install --apk 文件   # 使用已下载的 APK（仅支持 3.5.4，其他版本未经测试，会被拒绝）
-./WeTypeIME-Engine-x86_64.AppImage uninstall            # 卸载（保留词库和用户数据）
-./WeTypeIME-Engine-x86_64.AppImage demo nihao           # 命令行测试候选词
+./WeTypeIME-Engine-$(uname -m).AppImage install --apk 文件  # 使用已下载的 APK（仅支持 3.5.4）
+./WeTypeIME-Engine-$(uname -m).AppImage uninstall           # 卸载（保留词库和用户数据）
+./WeTypeIME-Engine-$(uname -m).AppImage demo nihao          # 命令行测试候选词
 ```
 
 APK 约 214 MB，只下载一次，缓存在 `~/.cache/wetype-ime`。用户学习数据在 `~/.local/share/wetype-ime`。
 
 ## 从源码构建
 
-构建环境为 x86_64 的 Debian / Ubuntu：
+在 x86_64 Debian / Ubuntu 上构建：
 
 ```sh
 sudo apt install build-essential cmake libfcitx5core-dev patchelf binutils file \
@@ -44,10 +44,19 @@ sudo apt install build-essential cmake libfcitx5core-dev patchelf binutils file 
   unzip python3 curl
 ```
 
-还需要 ARM64 的 zlib（`zlib1g-dev:arm64`），也可以用 `WETYPE_ZLIB_SO` 指向任意 ARM64 的 `libz.so.1`。Ubuntu 的 ARM64 软件包在 `ports.ubuntu.com`，需要先添加该源。
+还需要 ARM64 的 zlib（`zlib1g:arm64`），也可以用 `WETYPE_ZLIB_SO` 指向任意 ARM64 的 `libz.so.1`。Ubuntu 的 ARM64 软件包在 `ports.ubuntu.com`，需要先添加该源。
+
+在 ARM64 Debian / Ubuntu 上原生构建：
 
 ```sh
-scripts/e2_img.sh        # 构建插件、harness 并打包 AppImage（不需要 APK）
+sudo apt install build-essential cmake libfcitx5core-dev patchelf binutils file \
+  qemu-user-static zlib1g python3 unzip curl
+```
+
+两种主机均运行：
+
+```sh
+scripts/e2_img.sh        # 构建本机架构的插件、ARM64 harness 和 AppImage（不需要 APK）
 ```
 
 没有 FUSE 时（容器、虚拟机）请设置 `APPIMAGE_EXTRACT_AND_RUN=1`。打包时如果发现任何来自 APK 的文件，会拒绝打包。
