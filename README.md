@@ -1,10 +1,10 @@
 # WeType Linux
 
-在 Linux 上通过 Fcitx 5 使用微信输入法（WeType）引擎。引擎是 Android ARM64 版本，由 QEMU user 模式运行在 Android 自己的 C 运行时（AOSP bionic）上。
+在 Linux 上通过 Fcitx 5 使用微信输入法（WeType）引擎。引擎是 Android ARM64 版本，运行在 Android 自己的 C 运行时（AOSP bionic）上：x86_64 主机通过 QEMU user 模式运行，ARM64 主机原生运行，不需要 QEMU。
 
 > **非官方项目**，与腾讯无关，也未获其认可。WeType、微信输入法、微信是腾讯的商标。使用 WeType 引擎须遵守腾讯的相关条款。
 
-本仓库和 AppImage 只包含本项目自己的代码，以及可再分发的运行时（QEMU、取自 AOSP 系统镜像的 bionic），不包含任何 WeType 文件。安装时会从腾讯官方服务器下载 WeType 3.5.4 APK，校验 SHA-256 后在本机打补丁，思路类似 Minecraft 的 Paper。
+本仓库和 AppImage 只包含本项目自己的代码，以及可再分发的运行时（取自 AOSP 系统镜像的 bionic；x86_64 版另含 QEMU），不包含任何 WeType 文件。安装时会从腾讯官方服务器下载 WeType 3.5.4 APK，校验 SHA-256 后在本机打补丁，思路类似 Minecraft 的 Paper。
 
 ## 功能与限制
 
@@ -23,7 +23,7 @@
 
 本地词库和学习数据的保存不等于云同步。学习数据默认位于 `~/.local/share/wetype-ime/dict`，设置了 `XDG_DATA_HOME` 时使用 `$XDG_DATA_HOME/wetype-ime/dict`；高级调试可用 `WETYPE_WORK_DIR` 覆盖。
 
-当前安装包及构建目标为 **x86_64 Linux**。引擎是 ARM64 二进制，不代表本项目已提供 ARM64 Linux 的完整输入法安装包。默认在缺少有效 APK 缓存时联网下载；也可通过 `--apk` 使用已下载的 APK。英文释义是本地查表，不进行网络查询。上述功能清单不构成对专有引擎内部网络行为的保证。
+发布两种 AppImage：`WeTypeIME-Engine-x86_64.AppImage`（x86_64 Linux，自带 QEMU）和 `WeTypeIME-Engine-aarch64.AppImage`（ARM64 Linux，原生运行，不含 QEMU）。Fcitx5 插件在 Ubuntu 24.04 上随包构建，要求宿主有 glibc ≥ 2.38 和 Fcitx5 5.1.x（`libFcitx5Core.so.7`）；更旧的发行版（如 Ubuntu 20.04）请用 `fcitx5-wetype/build.sh` 按本机 Fcitx5 从源码构建插件。默认在缺少有效 APK 缓存时联网下载；也可通过 `--apk` 使用已下载的 APK。英文释义是本地查表，不进行网络查询。上述功能清单不构成对专有引擎内部网络行为的保证。
 
 ## 安装
 
@@ -35,10 +35,16 @@ sudo dnf install python3 unzip curl          # Fedora
 sudo pacman -S --needed python unzip curl    # Arch
 ```
 
+ARM64 主机还需要 `patchelf`（安装时把 harness 的 ELF 解释器指向包内的 bionic `linker64`，之后原生运行，不改动 `/system`）：
+
+```sh
+sudo apt install patchelf                    # Debian / Ubuntu；Fedora、Arch 同名
+```
+
 然后运行：
 
 ```sh
-./WeTypeIME-Engine-x86_64.AppImage install            # 安装到 ~/.local；用 sudo 则安装到 /usr
+./WeTypeIME-Engine-$(uname -m).AppImage install       # 安装到 ~/.local；用 sudo 则安装到 /usr
 ```
 
 安装完成后重启 Fcitx5，并在输入法配置中添加“微信拼音”。
@@ -48,16 +54,16 @@ sudo pacman -S --needed python unzip curl    # Arch
 其他命令：
 
 ```sh
-./WeTypeIME-Engine-x86_64.AppImage install --apk 文件   # 使用已下载的 APK（仅支持 3.5.4，其他版本未经测试，会被拒绝）
-./WeTypeIME-Engine-x86_64.AppImage uninstall            # 卸载（保留词库和用户数据）
-./WeTypeIME-Engine-x86_64.AppImage demo nihao           # 命令行测试候选词
+./WeTypeIME-Engine-$(uname -m).AppImage install --apk 文件   # 使用已下载的 APK（仅支持 3.5.4，其他版本未经测试，会被拒绝）
+./WeTypeIME-Engine-$(uname -m).AppImage uninstall            # 卸载（保留词库和用户数据）
+./WeTypeIME-Engine-$(uname -m).AppImage demo nihao           # 命令行测试候选词
 ```
 
 APK 约 214 MB，只下载一次，缓存在 `~/.cache/wetype-ime`。用户学习数据在 `~/.local/share/wetype-ime`。
 
 ## 从源码构建
 
-构建环境为 x86_64 的 Debian / Ubuntu：
+x86_64 AppImage 的构建环境为 x86_64 的 Debian / Ubuntu：
 
 ```sh
 sudo apt install build-essential cmake libfcitx5core-dev file qemu-user-static \
@@ -71,13 +77,26 @@ bash scripts/prepare_ndk.sh  # 从 Google 下载到 .deps/tools/，按官方校�
 export ANDROID_NDK_HOME="$PWD/.deps/tools/android-ndk-r27c"
 ```
 
-也可用 `ANDROID_NDK_HOME` 指向已有兼容 NDK；不设置时构建脚本回落到上述项目缓存。CI 固定使用 r27c。构建时还会下载 AOSP Android 9 的 ARM64 模拟器系统镜像（约 407 MB，缓存在 `.deps/aosp/`），校验 SHA-256 后提取 bionic 运行时。本构建方案要求 x86_64 Linux 主机，不包含 ARM64 原生构建或 ARM64 AppImage 支持。
+也可用 `ANDROID_NDK_HOME` 指向已有兼容 NDK；不设置时构建脚本回落到上述项目缓存。CI 固定使用 r27c。构建时还会下载 AOSP Android 9 的 ARM64 模拟器系统镜像（约 407 MB，缓存在 `.deps/aosp/`），校验 SHA-256 后提取 bionic 运行时。NDK 只有 x86_64 Linux 主机版，所以 harness 与 bionic 运行时总是在 x86_64 主机上构建；ARM64 AppImage 复用这些产物在 ARM64 主机上打包（见下）。
 
 ```sh
 scripts/e2_img.sh        # 构建插件、harness 并打包 AppImage（不需要 APK）
 ```
 
 没有 FUSE 时（容器、虚拟机）请设置 `APPIMAGE_EXTRACT_AND_RUN=1`。打包时如果发现任何来自 APK 的文件，会拒绝打包。
+
+**ARM64 AppImage**在 ARM64 主机上打包：先在 x86_64 主机上构建并导出 harness 与运行时，再到 ARM64 主机上用同一份源码打包。CI 自动完成这两步。
+
+```sh
+# x86_64 主机
+bash scripts/20_build.sh
+tar -cf engine-runtime.tar runtime/libandroid.so runtime/sysroot harness/jinterop
+
+# ARM64 主机（需要 build-essential cmake libfcitx5core-dev file patchelf curl）
+tar -xf engine-runtime.tar
+WETYPE_SKIP_NDK_BUILD=1 scripts/e2_img.sh        # 生成 WeTypeIME-Engine-aarch64.AppImage，包内不含 QEMU
+scripts/smoke_native_harness.sh AppDir/usr/lib/wetype-ime/arm64   # 原生冒烟测试，不需要 APK
+```
 
 在源码树中直接调试引擎：
 
@@ -94,6 +113,8 @@ scripts/10_patch_libs.sh     # 拷贝 APK 中的引擎库并打补丁，输出�
 ```sh
 python3 scripts/test_bionic_daemon.py --engine-dir "$HOME/.local/lib/wetype-ime/arm64" --idle-seconds 85
 ```
+
+ARM64 主机上加 `--native`（不经 QEMU；回归使用临时拷贝并用 `patchelf` 设置解释器，不改动已安装的 harness）。ARM64 与 x86_64 的候选延迟对比见 [docs/benchmarks/arm64-native-vs-qemu.md](docs/benchmarks/arm64-native-vs-qemu.md)。
 
 此回归覆盖候选、部分选词、学习、重置、长空闲恢复及重启持久化。插件及词表解析测试使用 `cmake -S fcitx5-wetype -B build && cmake --build build && ctest --test-dir build --output-on-failure`。
 
@@ -145,4 +166,4 @@ bash fcitx5-wetype/e2e/run_paging_e2e.sh 5
 
 ## 许可证
 
-本项目使用 GPL-3.0-or-later，见 [LICENSE](LICENSE)；`harness/jni.h` 取自 AOSP Android 9，来源见 [JNI 声明说明](licenses/jni/README.md)，完整 [Apache-2.0 许可证](licenses/Apache-2.0.txt) 随源码及 AppImage 附带。AppImage 内附带的 QEMU（GPL-2.0）和 AOSP 组件（bionic、liblog、libc++、zlib）的许可说明见镜像内的 `usr/share/doc/wetype-ime/THIRD-PARTY.md`。WeType 引擎和词库归腾讯所有，不在本许可范围内，本项目也不分发它们。
+本项目使用 GPL-3.0-or-later，见 [LICENSE](LICENSE)；`harness/jni.h` 取自 AOSP Android 9，来源见 [JNI 声明说明](licenses/jni/README.md)，完整 [Apache-2.0 许可证](licenses/Apache-2.0.txt) 随源码及 AppImage 附带。x86_64 AppImage 内附带的 QEMU（GPL-2.0）和两种 AppImage 内的 AOSP 组件（bionic、liblog、libc++、zlib）的许可说明见镜像内的 `usr/share/doc/wetype-ime/THIRD-PARTY.md`。WeType 引擎和词库归腾讯所有，不在本许可范围内，本项目也不分发它们。

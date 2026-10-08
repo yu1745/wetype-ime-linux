@@ -11,7 +11,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-x86_64:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -56,10 +56,82 @@ jobs:
             WeTypeIME-Engine-x86_64.AppImage
             WeTypeIME-Engine-x86_64.AppImage.sha256
 
+      # The NDK only runs on x86_64 hosts, so the ARM64 job reuses the NDK-built harness and
+      # libandroid.so stand-in plus the extracted bionic runtime. A tar keeps modes and symlinks.
+      - name: Archive engine build outputs for the ARM64 job
+        run: tar -cf engine-runtime.tar runtime/libandroid.so runtime/sysroot harness/jinterop
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-runtime
+          path: engine-runtime.tar
+          retention-days: 1
+
+  build-aarch64:
+    runs-on: ubuntu-24.04-arm
+    needs: build-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libfcitx5core-dev file patchelf \
+            python3 unzip curl ca-certificates
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: engine-runtime
+
+      - name: Unpack engine build outputs
+        run: tar -xf engine-runtime.tar
+
+      # No QEMU on ARM64: the harness runs natively once install points its ELF
+      # interpreter at the bundled bionic linker.
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'   # no FUSE on the runner
+          WETYPE_SKIP_NDK_BUILD: '1'
+        run: |
+          scripts/e2_img.sh
+          ctest --test-dir fcitx5-wetype/build --output-on-failure
+          sha256sum WeTypeIME-Engine-aarch64.AppImage > WeTypeIME-Engine-aarch64.AppImage.sha256
+          cat WeTypeIME-Engine-aarch64.AppImage.sha256
+
+      - name: Native smoke test
+        run: scripts/smoke_native_harness.sh AppDir/usr/lib/wetype-ime/arm64
+
+      - name: AppImage runs on ARM64
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: |
+          export HOME="$(mktemp -d)"
+          ./WeTypeIME-Engine-aarch64.AppImage uninstall --user
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WeTypeIME-Engine-aarch64
+          path: |
+            WeTypeIME-Engine-aarch64.AppImage
+            WeTypeIME-Engine-aarch64.AppImage.sha256
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-x86_64, build-aarch64]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: WeTypeIME-Engine-*
+          merge-multiple: true
+          path: dist
+
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
-            WeTypeIME-Engine-x86_64.AppImage WeTypeIME-Engine-x86_64.AppImage.sha256
+          ls -l dist
+          (cd dist && sha256sum -c WeTypeIME-Engine-*.sha256)
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes dist/WeTypeIME-Engine-*
