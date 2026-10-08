@@ -43,15 +43,21 @@ def repeated(text: str, length: int) -> str:
 class Daemon:
     def __init__(self, args, work_dir: str, log_path: Path):
         env = os.environ.copy()
+        lib_path = f"{args.engine_dir}/lib"
+        if args.native:
+            # Same launch as the ARM64 plugin: the harness runs directly, its interpreter
+            # already points at the bundled bionic linker (set at install time).
+            lib_path += f":{args.sysroot}/system/lib64"
         env.update({
-            "LD_LIBRARY_PATH": f"{args.engine_dir}/lib",
+            "LD_LIBRARY_PATH": lib_path,
             "WETYPE_DICT_DIR": f"{args.engine_dir}/dicts",
             "WETYPE_ASSET_DIR": f"{args.engine_dir}/dicts",
             "WETYPE_WORK_DIR": work_dir,
             "WETYPE_HARNESS_LOG": str(log_path),
         })
-        command = [args.qemu, "-L", args.sysroot, str(args.harness),
-                   str(args.engine_dir / "lib/libwxhld_jni.so"), "--daemon"]
+        launcher = [] if args.native else [args.qemu, "-L", args.sysroot]
+        command = launcher + [str(args.harness),
+                              str(args.engine_dir / "lib/libwxhld_jni.so"), "--daemon"]
         self.timeout = args.timeout
         self.stderr_file = open(log_path, "a", encoding="utf-8")
         started = time.monotonic()
@@ -215,6 +221,8 @@ def main() -> int:
     parser.add_argument("--engine-dir", type=Path, default=Path("/usr/lib/wetype-ime/arm64"))
     parser.add_argument("--harness", type=Path, default=None)
     parser.add_argument("--qemu", default="qemu-aarch64-static")
+    parser.add_argument("--native", action="store_true",
+                        help="run the harness directly on an ARM64 host (no QEMU)")
     parser.add_argument("--sysroot", default=None,
                         help="bionic runtime passed to qemu -L (default: <engine-dir>/sysroot)")
     parser.add_argument("--min-length", type=int, default=1,

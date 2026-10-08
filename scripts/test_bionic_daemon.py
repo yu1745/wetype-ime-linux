@@ -2,8 +2,8 @@
 """Headless engine regression, using only an isolated temporary user dictionary.
 
 Usage: python3 scripts/test_bionic_daemon.py --engine-dir /path/to/installed/arm64
-Add --native on ARM64 Linux after rebinding the test harness's ELF interpreter
-with patchelf to the absolute bundled linker64 path inside the temporary engine.
+Add --native on ARM64 Linux to run the harness without QEMU. It uses a temporary copy
+whose ELF interpreter is set with patchelf to the bundled bionic linker64.
 Do not change /system or patch an installed production harness.
 Add --idle-seconds 85 to cover delayed/background engine work.
 The same test can exercise the legacy glibc engine through its bundled QEMU.
@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import selectors
 import resource
+import shutil
 import subprocess
 import tempfile
 import time
@@ -29,13 +30,20 @@ class Engine:
         sysroot = root / "sysroot"
         env.update(LD_LIBRARY_PATH=str(lib), WETYPE_DICT_DIR=str(root / "dicts"),
                    WETYPE_ASSET_DIR=str(root / "dicts"), WETYPE_WORK_DIR=str(work))
+        harness = root / "wetype-harness"
         if native:
+            # Install-time step on ARM64 hosts: the harness interpreter points at the
+            # bundled bionic linker. Patch a temporary copy, never the installed harness.
             env["LD_LIBRARY_PATH"] += ":" + str(sysroot / "system/lib64")
+            harness = work.parent / "wetype-harness"
+            shutil.copy2(root / "wetype-harness", harness)
+            subprocess.run(["patchelf", "--set-interpreter", str(sysroot / "system/bin/linker64"),
+                            str(harness)], check=True)
             command = []
         else:
             launcher = qemu or str(root / "qemu-aarch64-static")
             command = [launcher, "-L", str(sysroot)]
-        command += [str(root / "wetype-harness"), str(lib / "libwxhld_jni.so"), "--daemon"]
+        command += [str(harness), str(lib / "libwxhld_jni.so"), "--daemon"]
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=log, env=env, cwd="/tmp", bufsize=0,
                                         preexec_fn=disable_core_dumps)

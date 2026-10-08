@@ -219,13 +219,25 @@ public:
             if (!logPath || !*logPath) logPath = "/tmp/wetype-harness.log";
             int logFd = open(logPath, O_WRONLY | O_CREAT | O_APPEND, 0600);
             if (logFd >= 0) { dup2(logFd, 2); close(logFd); }
-            setenv("LD_LIBRARY_PATH", (eng + "/lib").c_str(), 1);
+            std::string libPath = eng + "/lib";
+#if defined(__aarch64__)
+            // Native bionic libc/liblog/libc++ come from the bundled sysroot.
+            libPath += ":" + sysroot + "/system/lib64";
+#endif
+            setenv("LD_LIBRARY_PATH", libPath.c_str(), 1);
             setenv("WETYPE_DICT_DIR", dicts.c_str(), 1);
             setenv("WETYPE_ASSET_DIR", dicts.c_str(), 1);
             setenv("WETYPE_WORK_DIR", work.c_str(), 1);
+#if defined(__aarch64__)
+            // ARM64 host: exec the harness directly. Its ELF interpreter is set at
+            // install time to the bundled sysroot/system/bin/linker64 (patchelf).
+            execl((eng + "/wetype-harness").c_str(), (eng + "/wetype-harness").c_str(),
+                  (eng + "/lib/libwxhld_jni.so").c_str(), "--daemon", (char *)nullptr);
+#else
             execlp(qemu.c_str(), qemu.c_str(), "-L", sysroot.c_str(),
                    (eng + "/wetype-harness").c_str(),
                    (eng + "/lib/libwxhld_jni.so").c_str(), "--daemon", (char *)nullptr);
+#endif
             _exit(127);
         }
         close(inP[0]);
