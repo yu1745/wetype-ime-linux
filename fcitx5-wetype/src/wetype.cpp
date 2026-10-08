@@ -238,6 +238,9 @@ public:
                 execl((eng + "/wetype-harness").c_str(), (eng + "/wetype-harness").c_str(),
                       (eng + "/lib/libwxhld_jni.so").c_str(), "--daemon", (char *)nullptr);
             } else {
+                // QEMU's default "max" CPU enables pointer authentication, which it
+                // computes in software on every libc++ call: about 2x slower.
+                setenv("QEMU_CPU", "cortex-a72", 0);
                 execlp(qemu.c_str(), qemu.c_str(), "-L", sysroot.c_str(),
                        (eng + "/wetype-harness").c_str(),
                        (eng + "/lib/libwxhld_jni.so").c_str(), "--daemon", (char *)nullptr);

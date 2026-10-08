@@ -55,6 +55,7 @@ class Daemon:
             "WETYPE_WORK_DIR": work_dir,
             "WETYPE_HARNESS_LOG": str(log_path),
         })
+        env.setdefault("QEMU_CPU", "cortex-a72")   # same default as the plugin
         launcher = [] if args.native else [args.qemu, "-L", args.sysroot]
         command = launcher + [str(args.harness),
                               str(args.engine_dir / "lib/libwxhld_jni.so"), "--daemon"]

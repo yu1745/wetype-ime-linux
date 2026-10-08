@@ -52,6 +52,7 @@ def run_case(name: str, sequence: str, batch_size: int, args, result_rows: list)
             "WETYPE_WORK_DIR": work_dir,
             "WETYPE_HARNESS_LOG": str(log_path),
         })
+        env.setdefault("QEMU_CPU", "cortex-a72")   # same default as the plugin
         command = [args.qemu, "-L", args.sysroot, str(args.harness),
                    str(args.engine_dir / "lib/libwxhld_jni.so"), "--daemon"]
         started = time.monotonic()

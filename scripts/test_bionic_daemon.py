@@ -41,6 +41,7 @@ class Engine:
                             str(harness)], check=True)
             command = []
         else:
+            env.setdefault("QEMU_CPU", "cortex-a72")   # same default as the plugin
             launcher = qemu or str(root / "qemu-aarch64-static")
             command = [launcher, "-L", str(sysroot)]
         command += [str(harness), str(lib / "libwxhld_jni.so"), "--daemon"]

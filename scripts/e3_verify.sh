@@ -22,5 +22,5 @@ echo "--- 3. 用户词库目录 ---"
 ls "$WETYPE_WORK_DIR/userdict/" 2>/dev/null || echo "(尚未生成)"
 echo "--- 4. 选词学习验证 (拟好 rank2 → 选词后 rank1) ---"
 WETYPE_TEST_LEARN=1 LD_LIBRARY_PATH="$PWD/runtime" \
-  timeout 150 "${QEMU_AARCH64:-qemu-aarch64-static}" -L "${WETYPE_SYSROOT:-$PWD/runtime/sysroot}" \
+  timeout 150 "${QEMU_AARCH64:-qemu-aarch64-static}" -cpu "${QEMU_CPU:-cortex-a72}" -L "${WETYPE_SYSROOT:-$PWD/runtime/sysroot}" \
   ./harness/jinterop runtime/libwxhld_jni.so 2>/dev/null | grep -E '\[A\] rank|\[B\] rank' | head -6

@@ -117,7 +117,8 @@ SYSROOT="${WETYPE_SYSROOT:-$ENG/sysroot}"
 QEMU="${QEMU_AARCH64:-$ENG/qemu-aarch64-static}"
 LIBS="$ENG/lib"
 if [ -x "$QEMU" ]; then
-  RUN=("$QEMU" -L "$SYSROOT")
+  # 默认的 max 会启用指针认证，QEMU 用软件计算，慢约 2 倍
+  RUN=("$QEMU" -cpu "${QEMU_CPU:-cortex-a72}" -L "$SYSROOT")
 else
   RUN=()
   LIBS="$LIBS:$SYSROOT/system/lib64"

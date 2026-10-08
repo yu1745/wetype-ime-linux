@@ -24,7 +24,8 @@ if [ -z "$QEMU" ]; then   # 安装包自带 QEMU；ARM64 宿主无 QEMU 时直�
 fi
 RUN=()
 if [ -n "$QEMU" ]; then
-  RUN=("$QEMU" -L "$SYSROOT")
+  # 默认的 max 会启用指针认证，QEMU 用软件计算，慢约 2 倍
+  RUN=("$QEMU" -cpu "${QEMU_CPU:-cortex-a72}" -L "$SYSROOT")
 else
   LIBDIR_EXTRA=":$SYSROOT/system/lib64"
 fi
