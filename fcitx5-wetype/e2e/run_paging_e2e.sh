@@ -62,12 +62,14 @@ export WETYPE_PAGETEST_CONFIG="$T/config/fcitx5/config"
 env -u DISPLAY -u WAYLAND_DISPLAY fcitx5 --keep --replace \
   --disable=classicui,xim,waylandim,xcb,wayland,kimpanel >"$T/fcitx5.log" 2>&1 &
 FCITX_PID=$!
+export WETYPE_E2E_FCITX_PID="$FCITX_PID"
 echo "$FCITX_PID" >> "$T/pids"; sleep 4
 if ! grep -q "async addon init" "$T/fcitx5.log"; then
   echo "插件未加载, 日志尾部:"; tail -20 "$T/fcitx5.log"; exit 8
 fi
 
-python3 "$HERE/paging_test.py" "$PS"; RC=$?
+# Other isolated state-machine regressions reuse the same sandbox.
+python3 "${WETYPE_E2E_SCRIPT:-$HERE/paging_test.py}" "$PS"; RC=$?
 echo "E2E_PAGE_SIZE=$PS RC=$RC"
 [ "$RC" != 0 ] && { echo "--- 日志尾部 ---"; tail -30 "$T/fcitx5.log"; }
 exit $RC
