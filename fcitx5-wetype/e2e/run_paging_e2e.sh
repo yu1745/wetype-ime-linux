@@ -3,14 +3,21 @@
 # 不影响桌面会话, 把 Fcitx5 全局"候选词数量"设成指定值后真机验证翻页行为。
 #
 # 用法:  bash fcitx5-wetype/e2e/run_paging_e2e.sh [每页候选数]     # 默认 5
-# 前置:  cmake -S fcitx5-wetype -B build && cmake --build build
+# 前置:  fcitx5-wetype/build.sh (或 cmake -S fcitx5-wetype -B build && cmake --build build);
+#        插件位置也可用 LIB=/path/to/libfcitx5-wetype 指定
 # 依赖:  python3-dbus, gir1.2-glib-2.0, dbus, fcitx5, 已安装好的 WeType 引擎
 set -u
 PS="${1:-5}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$(dirname "$HERE")"                                  # fcitx5-wetype/
-LIB="${LIB:-$(dirname "$SRC")/build/libfcitx5-wetype}"
-[ -e "$LIB" ] || [ -e "$LIB.so" ] || { echo "找不到插件: $LIB(.so) — 先 cmake --build build"; exit 9; }
+# 默认依次找 build.sh 的输出(fcitx5-wetype/build)和 README 里 cmake -B build 的输出(仓库根 build)
+if [ -z "${LIB:-}" ]; then
+  for dir in "$SRC/build" "$(dirname "$SRC")/build"; do
+    LIB="$dir/libfcitx5-wetype"
+    [ -e "$LIB" ] || [ -e "$LIB.so" ] && break
+  done
+fi
+[ -e "$LIB" ] || [ -e "$LIB.so" ] || { echo "找不到插件: $LIB(.so) — 先运行 fcitx5-wetype/build.sh,或用 LIB=... 指定"; exit 9; }
 ENGINE_DIR="${WETYPE_ENGINE_DIR:-$HOME/.local/lib/wetype-ime/arm64}"
 
 T=$(mktemp -d /tmp/wetype-paging-e2e.XXXXXX)
