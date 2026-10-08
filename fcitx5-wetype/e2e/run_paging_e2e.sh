@@ -47,6 +47,16 @@ Layout=
 [GroupOrder]
 0=Default
 EOF
+# Actual IM switching needs a second group item. Keep default paging and
+# punctuation fixtures unchanged (their focus-history tests do not switch IM).
+if [ "${WETYPE_E2E_KEYBOARD:-0}" = 1 ]; then
+  cat >> "$T/config/fcitx5/profile" <<'EOF'
+
+[Groups/0/Items/1]
+Name=keyboard-us
+Layout=
+EOF
+fi
 
 dbus-daemon --session --fork --print-address=3 --print-pid=4 3>"$T/bus/addr" 4>"$T/bus/pid"
 for _ in $(seq 1 30); do [ -s "$T/bus/addr" ] && break; sleep 0.1; done
