@@ -9,12 +9,18 @@ set -u
 PS="${1:-5}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$(dirname "$HERE")"                                  # fcitx5-wetype/
-LIB="${LIB:-$SRC/build/libfcitx5-wetype}"
+LIB="${LIB:-$(dirname "$SRC")/build/libfcitx5-wetype}"
 [ -e "$LIB" ] || [ -e "$LIB.so" ] || { echo "找不到插件: $LIB(.so) — 先 cmake --build build"; exit 9; }
 ENGINE_DIR="${WETYPE_ENGINE_DIR:-$HOME/.local/lib/wetype-ime/arm64}"
 
 T=$(mktemp -d /tmp/wetype-paging-e2e.XXXXXX)
-trap 'kill $(cat "$T/pids" 2>/dev/null) 2>/dev/null; rm -rf "$T"' EXIT
+cleanup() {
+  kill $(cat "$T/pids" 2>/dev/null) 2>/dev/null || true
+  # Fcitx writes its config on exit; wait before removing the isolated tree.
+  [ -z "${FCITX_PID:-}" ] || wait "$FCITX_PID" 2>/dev/null || true
+  rm -rf "$T"
+}
+trap cleanup EXIT
 mkdir -p "$T/config/fcitx5" "$T/data/fcitx5/addon" "$T/data/fcitx5/inputmethod" "$T/bus"
 
 # 只装本插件: addon conf 里的 Library 换成刚构建的绝对路径
@@ -46,9 +52,12 @@ export XDG_CONFIG_HOME="$T/config" XDG_DATA_HOME="$T/data"
 export XDG_DATA_DIRS="/usr/local/share:/usr/share"
 export WETYPE_ENGINE_DIR="$ENGINE_DIR"
 export WETYPE_PAGETEST_LOG="$T/fcitx5.log"
+export WETYPE_PAGETEST_CONFIG="$T/config/fcitx5/config"
 
-fcitx5 --replace --disable=classicui --disable=xim --disable=waylandim >"$T/fcitx5.log" 2>&1 &
-echo $! >> "$T/pids"; sleep 4
+env -u DISPLAY -u WAYLAND_DISPLAY fcitx5 --keep --replace \
+  --disable=classicui,xim,waylandim,xcb,wayland,kimpanel >"$T/fcitx5.log" 2>&1 &
+FCITX_PID=$!
+echo "$FCITX_PID" >> "$T/pids"; sleep 4
 if ! grep -q "async addon init" "$T/fcitx5.log"; then
   echo "插件未加载, 日志尾部:"; tail -20 "$T/fcitx5.log"; exit 8
 fi

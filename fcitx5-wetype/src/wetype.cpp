@@ -21,6 +21,7 @@
 #include <fcitx-utils/event.h>
 #include <fcitx-utils/trackableobject.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -444,16 +445,31 @@ private:
         return (n >= 1 && n <= 10) ? n : FALLBACK_PAGE_SIZE;
     }
 
+    // Global page size can change while composing. Keep both indices valid
+    // and align the page before rendering or handling another selection key.
+    bool normalizePage() {
+        const int oldStart = windowStart_;
+        const int oldSelected = selected_;
+        const int count = static_cast<int>(cands_.size());
+        const int page = pageSize();
+        if (count == 0) {
+            windowStart_ = selected_ = 0;
+        } else {
+            windowStart_ = std::clamp(windowStart_, 0, count - 1);
+            windowStart_ = (windowStart_ / page) * page;
+            selected_ = std::clamp(selected_, windowStart_,
+                                  std::min(windowStart_ + page, count) - 1);
+        }
+        return oldStart != windowStart_ || oldSelected != selected_ ||
+               (!cands_.empty() && renderedPageSize_ != page);
+    }
+
     void updateUI(InputContext &ic) {
+        normalizePage();
+        renderedPageSize_ = pageSize();
         auto &panel = ic.inputPanel();
         panel.reset();
         panel.setPreedit(pinyinPreedit(buf_));
-        if (!cands_.empty()) {
-            if (windowStart_ >= static_cast<int>(cands_.size())) {
-                windowStart_ = 0;
-                selected_ = 0;
-            }
-        }
         if (!cands_.empty()) {
             const int start = windowStart_;
             const int end = std::min<int>(start + pageSize(), cands_.size());
@@ -640,6 +656,7 @@ private:
     bool candidatesCurrent_ = false;
     int windowStart_ = 0;
     int selected_ = 0;
+    int renderedPageSize_ = 0;
     bool recoveryTried_ = false;
     uint64_t revision_ = 0;
     TrackableObjectReference<InputContext> icRef_;
@@ -674,6 +691,7 @@ void WeTypeEngine::keyEvent(const InputMethodEntry &, KeyEvent &event) {
     }
 
     if (!event.isRelease()) {
+        if (normalizePage()) updateUI(*ic);
         // Alphabet keys, including Shift/CapsLock symbols, become lowercase
         // pinyin. Ctrl/Alt/Super/Meta shortcuts were passed through above.
         if ((sym >= FcitxKey_a && sym <= FcitxKey_z) ||
@@ -707,15 +725,14 @@ void WeTypeEngine::keyEvent(const InputMethodEntry &, KeyEvent &event) {
                                                      cands_.size())) {
                 ++selected_;
             } else if (sym == FcitxKey_Up && windowStart_ > 0) {
-                windowStart_ -= page;
+                windowStart_ = std::max(0, windowStart_ - page);
                 selected_ = windowStart_;
             } else if (sym == FcitxKey_Down &&
                        windowStart_ + page < (int)cands_.size()) {
                 windowStart_ += page;
                 selected_ = windowStart_;
-            } else {
-                return;   // 无处可移动: 保留默认按键行为
             }
+            // Composition navigation remains consumed at page boundaries.
             updateUI(*ic);
             handled = true;
         }
