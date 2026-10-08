@@ -44,6 +44,14 @@ class Client:
         self.ic.SetCapability(dbus.UInt64(capabilities))
         self.commits = []
         self.candidates = []
+        self.ui_serial = 0
+        self.forwarded = []
+        self.preedits = []
+        self.events = []
+        bus.add_signal_receiver(self._forward, dbus_interface="org.fcitx.Fcitx.InputContext1",
+                                signal_name="ForwardKey", path=self.path)
+        bus.add_signal_receiver(self._preedit, dbus_interface="org.fcitx.Fcitx.InputContext1",
+                                signal_name="UpdateFormattedPreedit", path=self.path)
         bus.add_signal_receiver(self._commit, dbus_interface="org.fcitx.Fcitx.InputContext1",
                                 signal_name="CommitString", path=self.path)
         bus.add_signal_receiver(self._ui, dbus_interface="org.fcitx.Fcitx.InputContext1",
@@ -51,8 +59,18 @@ class Client:
 
     def _commit(self, text):
         self.commits.append(str(text))
+        self.events.append(("commit", str(text)))
+
+    def _forward(self, *args):
+        event = tuple(int(a) for a in args)
+        self.forwarded.append(event)
+        self.events.append(("forward", event))
+
+    def _preedit(self, *args):
+        self.preedits.append(args)
 
     def _ui(self, *args):
+        self.ui_serial += 1
         self.candidates[:] = [(str(c[0]), str(c[1])) for c in args[4]]
 
     def focus(self):
@@ -62,13 +80,30 @@ class Client:
         pump()
 
     def press(self, key, delay=0.1, states=0, release=False):
-        sym = KEYS[key] if key in KEYS else ord(key)
+        sym = key if isinstance(key, int) else KEYS[key] if key in KEYS else ord(key)
         consumed = self.ic.ProcessKeyEvent(dbus.UInt32(sym), dbus.UInt32(0),
                                            dbus.UInt32(states), dbus.Boolean(release),
                                            dbus.UInt32(int(time.time() * 1000) & 0xFFFFFFFF))
         if delay:
             pump(delay)
         return bool(consumed)
+
+    def synchronize_ui(self):
+        # Log output precedes updateUI. A round trip processes the server's
+        # pending work; then dispatch its asynchronous signals to this client.
+        # Require a quiet UI interval, restarting it for every delivered update.
+        controller.CurrentInputMethod()
+        deadline = time.monotonic() + 2
+        serial = self.ui_serial
+        quiet_since = time.monotonic()
+        while time.monotonic() < deadline:
+            pump(.02)
+            if self.ui_serial != serial:
+                serial = self.ui_serial
+                quiet_since = time.monotonic()
+            if time.monotonic() - quiet_since >= .15:
+                return
+        raise AssertionError("candidate UI did not settle")
 
     def type(self, text, wait=True):
         log = Path(os.environ["WETYPE_PAGETEST_LOG"])
@@ -83,6 +118,7 @@ class Client:
                     stream.seek(offset)
                     lines = stream.read()
                 if re.search(r"parsed candidates=[1-9][0-9]* buffer_len=%d preview=0" % len(text), lines):
+                    self.synchronize_ui()
                     return
             raise AssertionError("current candidates did not arrive")
 
@@ -110,7 +146,7 @@ def paused_engine():
     pid = matches[0]
     os.kill(pid, signal.SIGSTOP)
     try:
-        yield
+        yield pid
     finally:
         try:
             command = Path("/proc/%d/cmdline" % pid).read_bytes().split(b"\0")

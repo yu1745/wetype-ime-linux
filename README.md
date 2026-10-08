@@ -108,7 +108,7 @@ python3 scripts/test_bionic_daemon.py --engine-dir "$HOME/.local/lib/wetype-ime/
 
 兼容 [qingjian](https://github.com/qingjian-team/qingjian) 的 `glossary-en.tsv` 格式；本仓库不附带词表。匹配到的释义以斜体追加在候选后，仅供展示，不改变候选顺序、选词键或上屏内容。缺少词表或未匹配到词条时，候选显示不变。候选数量仍跟随 Fcitx5 全局配置。
 
-英文释义只影响展示；标点规则见下节，空格提交仍为原有行为。
+英文释义只影响展示；标点与异步空格规则见下节。
 
 ## 智能逗号与句号
 
@@ -117,6 +117,24 @@ python3 scripts/test_bionic_daemon.py --engine-dir "$HOME/.local/lib/wetype-ime/
 - 周围文本只在应用更新时刷新；刚提交的文本不会被尚未更新的旧周围文本覆盖。不同输入上下文的状态不共享。
 - 无周围文本时，透传数字也会使后续句点保持半角，以免把小数点变成句号。应用标记的密码、邮箱、URL、数字等结构化字段保留半角分隔符。
 - 只转换逗号和句号，不转换其他标点；快捷键及按键释放仍透传。没有接入账号或网络查询。
+
+## 异步空格选词
+
+- 拼音的最新候选尚未返回时，空格会等待该次候选，而不是立即提交原始拼音；旧前缀预览不能代替当前候选。
+- 等待期间后续可打印按键及释放按顺序排队。一次空格只选择一个候选片段；连续空格可继续选择剩余拼音，组词结束后的空格正常透传。
+- 退格先删除排队的最新输入；队列没有输入时删除拼音，并继续等待编辑后的候选。Esc/reset 取消整个未提交组词。
+- Enter、无候选或恢复失败时按原文提交，包括已输入的空格与后续文字。等待最多 5 秒，队列最多 256 个按键事件；到限同样原文提交，不静默丢字。
+- 导航或快捷键先结束等待、提交原文，再透传，避免后续文字落到移动后的光标处。切换输入法也保留完整原文；切换应用沿用不额外上屏的行为，预编辑包含排队文字，最终是否上屏由前端处理。
+
+可在私有 D-Bus 与临时配置中运行回归（不修改桌面输入法）：
+
+```sh
+WETYPE_ENGINE_DIR=/path/to/engine WETYPE_E2E_KEYBOARD=1 \
+WETYPE_E2E_SCRIPT="$PWD/fcitx5-wetype/e2e/pending_space_test.py" \
+bash fcitx5-wetype/e2e/run_paging_e2e.sh 5
+```
+
+`pending_engine_fixture.py` 是仅供隔离测试的协议响应器；用 `QEMU_AARCH64` 指向它，配合 `WETYPE_PENDING_FIXTURE=empty|error|skip|startup-failure` 和 `pending_failure_test.py` 验证确定性失败路径，不代表真实引擎测试。
 
 ## 目录结构
 

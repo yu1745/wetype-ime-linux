@@ -422,26 +422,19 @@ public:
         ensureEngine();
     }
     ~WeTypeEngine() override {
+        cancelPending();
         restartSource_.reset();
         eng_.stop();
     }
 
-    void keyEvent(const InputMethodEntry &, KeyEvent &event) override;
+    void keyEvent(const InputMethodEntry &, KeyEvent &event) override { processKey(event); }
 
     void reset(const InputMethodEntry &entry, InputContextEvent &event) override {
         auto *ic = event.inputContext();
         if (!ic) return;
         bool had = !buf_.empty() || !cands_.empty();
-        ++revision_;
-        buf_.clear();
-        cands_.clear();
-        covers_.clear();
-        candidatesCurrent_ = false;
-        windowStart_ = 0;
-        selected_ = 0;
-        recoveryTried_ = false;
         eng_.send("SAVE", nullptr);
-        eng_.send("C", nullptr);
+        clearAll();
         if (had) updateUI(*ic);
     }
 
@@ -454,25 +447,20 @@ public:
         // the unfinished pinyin as literal text instead of dropping it.
         if (event.type() == EventType::InputContextSwitchInputMethod && !buf_.empty()) {
             WLOG("deactivate commits raw pinyin len=%zu\n", buf_.size());
-            rememberLanguage(ic, buf_);
-            ic->commitString(buf_);
+            const auto raw = pendingRaw();
+            rememberLanguage(ic, raw);
+            ic->commitString(raw);
         } else if (event.type() == EventType::InputContextSwitchInputMethod) {
             ic->propertyFor(&punctuationFactory_)->language = wetype::TextLanguage::Unknown;
         }
         bool had = !buf_.empty() || !cands_.empty();
-        ++revision_;
-        buf_.clear();
-        cands_.clear();
-        covers_.clear();
-        candidatesCurrent_ = false;
-        windowStart_ = 0;
-        selected_ = 0;
-        recoveryTried_ = false;
-        eng_.send("C", nullptr);
+        clearAll();
         if (had) updateUI(*ic);
     }
 
 private:
+    void processKey(KeyEvent &event);
+
     // 每页候选数跟随 fcitx5 全局设置"候选词数量"(1-10), 取不到时回退 5。
     // 翻页步进、面板显示与数字选词都以它为准, 保证每个可见候选都能选中。
     int pageSize() const {
@@ -504,7 +492,9 @@ private:
         renderedPageSize_ = pageSize();
         auto &panel = ic.inputPanel();
         panel.reset();
-        panel.setPreedit(pinyinPreedit(buf_));
+        // Frontends may commit preedit on focus-out; include all consumed text.
+        if (pending_) panel.setPreedit(Text(pendingRaw()));
+        else panel.setPreedit(pinyinPreedit(buf_));
         if (!cands_.empty()) {
             const int start = windowStart_;
             const int end = std::min<int>(start + pageSize(), cands_.size());
@@ -627,14 +617,15 @@ private:
     // stale replies are ignored.
     EngineProc::Handler candidateHandler() {
         auto ref = icRef_;
+        const auto expectedEpoch = epoch_;
         const auto expectedBuf = buf_;
         const auto expectedRevision = revision_;
-        return [this, ref, expectedBuf, expectedRevision](const std::string &resp) {
+        return [this, ref, expectedEpoch, expectedBuf, expectedRevision](const std::string &resp) {
             fcitx::InputContext *ic = ref.get();
             WLOG("response len=%zu prefix=%.4s expected_revision=%llu current_revision=%llu valid_ic=%d\n",
                  resp.size(), resp.c_str(), static_cast<unsigned long long>(expectedRevision),
                  static_cast<unsigned long long>(revision_), ic ? 1 : 0);
-            if (!ic || resp == "SKIP") return;   // SKIP: merged into a later request
+            if (!ic || ic != icRef_.get() || expectedEpoch != epoch_ || resp == "SKIP") return;   // SKIP: merged into a later request
             const bool current = expectedRevision == revision_ && expectedBuf == buf_;
             const bool preview = !current && !expectedBuf.empty() &&
                                  buf_.size() > expectedBuf.size() &&
@@ -659,6 +650,11 @@ private:
                 // (OK/ERR): rebuild the session from the remaining pinyin.
                 WLOG("unexpected candidate reply prefix=%.4s; replaying buffer_len=%zu\n",
                      resp.c_str(), buf_.size());
+                if (recoveryTried_) {
+                    if (pending_) fallbackPending(ic);
+                    return;
+                }
+                recoveryTried_ = true;
                 eng_.send("C", nullptr);
                 requestCandidates(buf_);
                 return;
@@ -687,6 +683,14 @@ private:
             windowStart_ = 0;
             selected_ = 0;
             updateUI(*ic);
+            if (current && pending_) {
+                if (cands_.empty()) fallbackPending(ic);
+                else {
+                    disarmPending();
+                    commitCandidate(ic, selected_);
+                    drainQueued(ic);
+                }
+            }
         };
     }
 
@@ -697,6 +701,84 @@ private:
         WLOG("send keys chars=%zu buffer_len=%zu revision=%llu\n", keys.size(),
              buf_.size(), static_cast<unsigned long long>(revision_));
         eng_.send("B " + keys, candidateHandler());
+    }
+
+    struct QueuedKey {
+        Key key, raw;
+        bool release;
+        int time;
+    };
+    bool pending_ = false;
+    std::deque<QueuedKey> queued_;
+    std::unique_ptr<EventSourceTime> pendingTimer_;
+    bool draining_ = false;
+    uint64_t epoch_ = 0;
+
+    static std::string printableText(Key key) {
+        const auto codepoint = Key::keySymToUnicode(key.sym());
+        if (codepoint < 0x20 || (codepoint >= 0x7f && codepoint <= 0x9f)) return {};
+        return Key::keySymToUTF8(key.sym());
+    }
+
+    static bool printable(Key key) { return !printableText(key).empty(); }
+
+    std::string pendingRaw() const {
+        std::string raw = buf_;
+        if (pending_) raw += ' ';
+        for (const auto &key : queued_) {
+            if (!key.release) raw += printableText(key.key);
+        }
+        return raw;
+    }
+
+    void disarmPending() {
+        pending_ = false;
+        pendingTimer_.reset();
+    }
+
+    void cancelPending() {
+        disarmPending();
+        queued_.clear();
+    }
+
+    void fallbackPending(InputContext *ic) {
+        const auto raw = pendingRaw();
+        auto keys = std::move(queued_);
+        cancelPending();
+        commitText(ic, raw);
+        for (const auto &key : keys) {
+            if (key.release) ic->forwardKey(key.raw, true, key.time);
+        }
+    }
+
+    void armPending(InputContext *ic) {
+        pending_ = true;
+        auto ref = ic->watch();
+        const auto epoch = epoch_;
+        // Finite wait covers SKIP, hung engines, and exhausted restarts.
+        pendingTimer_ = instance_->eventLoop().addTimeEvent(
+            CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + 5000000, 0,
+            [this, ref, epoch](EventSourceTime *, uint64_t) {
+                if (auto *owner = ref.get(); owner && owner == icRef_.get() &&
+                    epoch == epoch_ && pending_) fallbackPending(owner);
+                return true;
+            });
+        updateUI(*ic);
+        if ((candidatesCurrent_ && cands_.empty()) || eng_.gaveUp()) fallbackPending(ic);
+    }
+
+    void drainQueued(InputContext *ic) {
+        if (draining_) return;
+        draining_ = true;
+        while (!pending_ && !queued_.empty() && icRef_.get() == ic) {
+            const auto key = queued_.front();
+            queued_.pop_front();
+            KeyEvent event(ic, key.raw, key.release, key.time);
+            event.setKey(key.key);
+            processKey(event);
+            if (!event.filtered()) ic->forwardKey(key.raw, key.release, key.time);
+        }
+        draining_ = false;
     }
 
     Instance *instance_;
@@ -720,6 +802,8 @@ private:
     TrackableObjectReference<InputContext> icRef_;
 
     void clearAll(InputContext *ic = nullptr) {
+        cancelPending();
+        ++epoch_;
         ++revision_;
         buf_.clear();
         cands_.clear();
@@ -734,12 +818,67 @@ private:
 
 };
 
-void WeTypeEngine::keyEvent(const InputMethodEntry &, KeyEvent &event) {
+void WeTypeEngine::processKey(KeyEvent &event) {
     auto ic = event.inputContext();
     WLOG("keyEvent sym=%d ready=%d\n", (int)event.key().sym(), eng_.ready() ? 1 : 0);
     const auto sym = event.key().sym();
     bool handled = false;
+    if (icRef_.get() != ic) clearAll();
     icRef_ = ic->watch();
+
+    if (pending_) {
+        const bool shortcut = event.key().states().testAny(KeyStates{
+            KeyState::Ctrl, KeyState::Alt, KeyState::Super, KeyState::Super2,
+            KeyState::Meta, KeyState::Hyper, KeyState::Hyper2, KeyState::Mod5});
+        if (!event.isRelease() && !shortcut && sym == FcitxKey_Escape) {
+            clearAll(ic);
+            event.filterAndAccept();
+            return;
+        }
+        if (!event.isRelease() && !shortcut && sym == FcitxKey_BackSpace) {
+            // Delete the latest deferred press and any trailing release first.
+            auto last = std::find_if(queued_.rbegin(), queued_.rend(),
+                [](const QueuedKey &key) { return !key.release; });
+            if (last != queued_.rend()) {
+                auto press = std::prev(last.base());
+                const auto raw = press->raw;
+                auto next = queued_.erase(press);
+                auto release = std::find_if(next, queued_.end(), [&raw](const QueuedKey &key) {
+                    return key.release && key.raw.sym() == raw.sym();
+                });
+                if (release != queued_.end()) queued_.erase(release);
+                updateUI(*ic);
+                event.filterAndAccept();
+                return;
+            }
+            // The pending Space remains an intent after editing the frozen
+            // pinyin. Old replies are invalidated by the new revision.
+            buf_.pop_back();
+            ++revision_;
+            candidatesCurrent_ = false;
+            cands_.clear();
+            covers_.clear();
+            eng_.send("C", nullptr);
+            if (buf_.empty()) fallbackPending(ic);
+            else {
+                requestCandidates(buf_);
+                updateUI(*ic);
+            }
+            event.filterAndAccept();
+            return;
+        } else if (!event.isRelease() && (!printable(event.key()) || shortcut)) {
+            // Navigation and shortcuts must not overtake consumed text.
+            fallbackPending(ic);
+            if (!shortcut && sym == FcitxKey_Return) event.filterAndAccept();
+            return;
+        } else {
+            queued_.push_back({event.key(), event.rawKey(), event.isRelease(), event.time()});
+            event.filterAndAccept();
+            if (queued_.size() >= 256) fallbackPending(ic);
+            else updateUI(*ic);
+            return;
+        }
+    }
 
     if (event.key().states().testAny(KeyStates{KeyState::Ctrl, KeyState::Alt,
                                                KeyState::Super, KeyState::Super2,
@@ -857,7 +996,7 @@ void WeTypeEngine::keyEvent(const InputMethodEntry &, KeyEvent &event) {
         else if (sym == FcitxKey_space) {
             if (!buf_.empty()) {
                 if (candidatesCurrent_ && !cands_.empty()) commitCandidate(ic, selected_);   // 含部分选词与词库学习
-                else commitText(ic, buf_);
+                else armPending(ic);
                 handled = true;
             }
         }
@@ -893,15 +1032,7 @@ void WeTypeEngine::keyEvent(const InputMethodEntry &, KeyEvent &event) {
         // Esc: 清空
         else if (sym == FcitxKey_Escape) {
             if (!buf_.empty()) {
-                ++revision_;
-                buf_.clear();
-                cands_.clear();
-                covers_.clear();
-                candidatesCurrent_ = false;
-                windowStart_ = 0;
-                selected_ = 0;
-                eng_.send("C", nullptr);
-                updateUI(*ic);
+                clearAll(ic);
                 handled = true;
             }
         }
