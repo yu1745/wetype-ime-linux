@@ -22,6 +22,10 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir -p "$T/config/fcitx5" "$T/data/fcitx5/addon" "$T/data/fcitx5/inputmethod" "$T/bus"
+if [ "${WETYPE_PAGETEST_GLOSSARY:-0}" = 1 ]; then
+  mkdir -p "$T/data/wetype-ime"
+  cp "$HERE/glossary-fixture.tsv" "$T/data/wetype-ime/glossary-en.tsv"
+fi
 
 # 只装本插件: addon conf 里的 Library 换成刚构建的绝对路径
 cp "$SRC/wetype-im.conf" "$T/data/fcitx5/inputmethod/"
@@ -51,6 +55,7 @@ echo "$(cat "$T/bus/pid")" > "$T/pids"
 export XDG_CONFIG_HOME="$T/config" XDG_DATA_HOME="$T/data"
 export XDG_DATA_DIRS="/usr/local/share:/usr/share"
 export WETYPE_ENGINE_DIR="$ENGINE_DIR"
+export WETYPE_WORK_DIR="$T/data/wetype-ime/dict"
 export WETYPE_PAGETEST_LOG="$T/fcitx5.log"
 export WETYPE_PAGETEST_CONFIG="$T/config/fcitx5/config"
 

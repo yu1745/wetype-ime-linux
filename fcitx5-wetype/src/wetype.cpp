@@ -42,6 +42,8 @@
 #include <sstream>
 #include <unordered_set>
 
+#include "glossary.h"
+
 namespace fcitx {
 
 static constexpr int FALLBACK_PAGE_SIZE = 5;   // 取不到全局设置时的每页候选数
@@ -381,6 +383,12 @@ public:
     explicit WeTypeEngine(Instance *instance)
         : instance_(instance), eng_(instance->eventLoop()) {
         signal(SIGPIPE, SIG_IGN);
+        const char *xdg = getenv("XDG_DATA_HOME");
+        const char *home = getenv("HOME");
+        const std::string dataHome = xdg && *xdg ? xdg :
+            std::string(home ? home : "/root") + "/.local/share";
+        const std::size_t glossCount = glossary_.load(dataHome + "/wetype-ime/glossary-en.tsv");
+        if (glossCount) WLOG("glossary loaded: %zu entries\n", glossCount);
         std::string eng, dicts, work, qemu, sysroot;
         resolveDirs(eng, dicts, work, qemu, sysroot);
         WLOG("async addon init: eng=%s\n", eng.c_str());
@@ -485,6 +493,9 @@ private:
                 candidate.append(std::string(1, ordinal == 9 ? '0'
                                         : static_cast<char>('1' + ordinal)) + " ");
                 candidate.append(cands_[index]);
+                if (const auto *gloss = glossary_.lookup(cands_[index])) {
+                    candidate.append(" " + *gloss, TextFormatFlag::Italic);
+                }
                 cl->append<GridColumnCandidate>(std::move(candidate),
                     [this, index](InputContext *context) {
                         commitCandidate(context, index);
@@ -645,6 +656,7 @@ private:
     }
 
     Instance *instance_;
+    wetype::Glossary glossary_;
     EngineProc eng_;
     std::string buf_;
     std::unique_ptr<EventSourceTime> restartSource_;

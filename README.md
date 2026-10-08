@@ -64,6 +64,19 @@ scripts/10_patch_libs.sh     # 修补 APK 中的库，输出到 runtime/
 
 插件日志默认写入 `/tmp/wetype-harness.log`。
 
+## 可选候选英文释义
+
+将 UTF-8 词表放到 `~/.local/share/wetype-ime/glossary-en.tsv`，设置了 `XDG_DATA_HOME` 时则放到 `$XDG_DATA_HOME/wetype-ime/glossary-en.tsv`。重启 Fcitx5 后加载，无网络请求。词表格式为 `中文词<TAB>[词性. ]英文释义`，例如：
+
+```text
+你好	n. hello
+世界	n. world
+```
+
+兼容 [qingjian](https://github.com/qingjian-team/qingjian) 的 `glossary-en.tsv` 格式；本仓库不附带词表。匹配到的释义以斜体追加在候选后，仅供展示，不改变候选顺序、选词键或上屏内容。缺少词表或未匹配到词条时，候选显示不变。候选数量仍跟随 Fcitx5 全局配置。
+
+此项仅引入英文释义，不改变现有标点或空格提交行为。
+
 ## 目录结构
 
 - `fcitx5-wetype/`：Fcitx 5 插件
