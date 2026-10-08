@@ -3,17 +3,24 @@
 set -eo pipefail
 BASE="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$BASE"
-TOOL="${APPIMAGETOOL:-$BASE/.deps/tools/appimagetool-1.9.1-x86_64.AppImage}"
+ARCH="${ARCH:-$(uname -m)}"
+case "$ARCH" in
+  x86_64|aarch64) ;;
+  *) echo "Unsupported AppImage architecture: $ARCH (x86_64 or aarch64)" >&2; exit 1 ;;
+esac
+# appimagetool runs on the build host, so its architecture is the host's.
+TOOL_ARCH="$(uname -m)"
+TOOL="${APPIMAGETOOL:-$BASE/.deps/tools/appimagetool-1.9.1-$TOOL_ARCH.AppImage}"
 if [ ! -x "$TOOL" ]; then
-  echo "== 下载 appimagetool 1.9.1 =="
+  echo "== 下载 appimagetool 1.9.1 ($TOOL_ARCH) =="
   mkdir -p "$(dirname "$TOOL")"
   curl -fL --retry 3 -o "$TOOL" \
-    https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+    "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-$TOOL_ARCH.AppImage"
   chmod +x "$TOOL"
 fi
+export WETYPE_TARGET_ARCH="$ARCH"
 bash scripts/e1_appdir.sh
 cp AppDir/usr/share/applications/wetype-ime.desktop AppDir/
-ARCH="${ARCH:-$(uname -m)}"
 OUT="WeTypeIME-Engine-${ARCH}.AppImage"
 rm -f WeTypeIME-Engine-*.AppImage
 TOOL_ARGS=(--comp zstd)

@@ -84,12 +84,20 @@ print_existing_paths() {
   fi
 }
 
+# An AppImage without bundled QEMU is the ARM64 build: the harness runs natively.
+native=0
+[ -f "$src_eng/qemu-aarch64-static" ] || native=1
+
 # Check everything up front and print a copy-paste command; never install packages ourselves.
 check_install_deps() {
   local missing=() cmd tool id=
   for tool in python3 unzip sha256sum; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
   done
+  # Native layout: the harness ELF interpreter is rewritten to the bundled bionic linker.
+  if [ "$native" = 1 ]; then
+    command -v patchelf >/dev/null 2>&1 || missing+=(patchelf)
+  fi
   if [ -z "$apk" ] && ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
     missing+=(curl)
   fi
@@ -105,6 +113,9 @@ check_install_deps() {
     *" fedora "*|*" rhel "*|*" centos "*) cmd="sudo dnf install python3 unzip curl" ;;
     *" suse "*|*" opensuse "*) cmd="sudo zypper install python3 unzip curl" ;;
   esac
+  if [ -n "${cmd:-}" ] && [ "$native" = 1 ]; then
+    cmd="$cmd patchelf"
+  fi
   if [ -n "${cmd:-}" ]; then
     echo "请先运行：$cmd" >&2
   else
@@ -114,10 +125,16 @@ check_install_deps() {
 }
 
 if [ "$action" = install ]; then
+  if [ "$native" = 1 ]; then
+    case "$(uname -m)" in
+      aarch64|arm64) ;;
+      *) echo "此 AppImage 不含 QEMU，只能安装在 ARM64 主机上（当前：$(uname -m)）。" >&2; exit 1 ;;
+    esac
+  fi
   for required in \
     "$src_eng/wetype-harness" "$src_eng/wetype-ime-demo.sh" \
     "$src_eng/lib/libandroid.so" \
-    "$src_eng/qemu-aarch64-static" "$src_eng/sysroot/system/bin/linker64" \
+    "$src_eng/sysroot/system/bin/linker64" \
     "$src_scripts/prepare_assets.sh" "$src_scripts/10_patch_libs.sh" \
     "$src/lib/fcitx5/libfcitx5-wetype.so" \
     "$src/share/fcitx5/addon/wetype.conf" \
@@ -150,9 +167,20 @@ if [ "$action" = install ]; then
   done
   install -m 755 "$src_eng/wetype-harness" "$eng/wetype-harness"
   install -m 755 "$src_eng/wetype-ime-demo.sh" "$eng/wetype-ime-demo.sh"
-  install -m 755 "$src_eng/qemu-aarch64-static" "$eng/qemu-aarch64-static"
+  if [ "$native" = 1 ]; then
+    rm -f "$eng/qemu-aarch64-static"   # a leftover QEMU would make the engine launchers pick it
+  else
+    install -m 755 "$src_eng/qemu-aarch64-static" "$eng/qemu-aarch64-static"
+  fi
   rm -rf "$eng/sysroot"
   cp -a --no-preserve=ownership "$src_eng/sysroot" "$eng/sysroot"
+  if [ "$native" = 1 ]; then
+    # The harness is an NDK-built bionic executable whose interpreter is /system/bin/linker64.
+    # Point it at the bundled linker so it runs without QEMU and without touching /system.
+    patchelf --set-interpreter "$eng/sysroot/system/bin/linker64" "$eng/wetype-harness"
+    [ "$(patchelf --print-interpreter "$eng/wetype-harness")" = "$eng/sysroot/system/bin/linker64" ] ||
+      { echo "无法设置 harness 的 ELF 解释器：$eng/wetype-harness" >&2; exit 1; }
+  fi
   install -m 755 "$src/bin/wetype-ime-engine" "$prefix/bin/wetype-ime-engine"
   install -m 755 "$src/bin/wetype-demo" "$prefix/bin/wetype-demo"
   install -m 755 "$src/lib/fcitx5/libfcitx5-wetype.so" "$addon"

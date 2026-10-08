@@ -156,11 +156,17 @@ static void resolveDirs(std::string &eng, std::string &dicts, std::string &work,
         }
     }
     dicts = getenv("WETYPE_DICT_DIR") ? getenv("WETYPE_DICT_DIR") : eng + "/dicts";
-    // QEMU 随安装一起提供，缺失时回落到系统包；bionic 运行时只随安装提供
+    // QEMU 随安装一起提供，缺失时回落到系统包；bionic 运行时只随安装提供。
+    // ARM64 宿主没有 QEMU 时 qemu 为空，表示直接运行 harness。
     qemu = getenv("QEMU_AARCH64") ? getenv("QEMU_AARCH64") : "";
-    if (qemu.empty())
-        qemu = ::access((eng + "/qemu-aarch64-static").c_str(), X_OK) == 0
-                   ? eng + "/qemu-aarch64-static" : "qemu-aarch64-static";
+    if (qemu.empty()) {
+        if (::access((eng + "/qemu-aarch64-static").c_str(), X_OK) == 0)
+            qemu = eng + "/qemu-aarch64-static";
+#if !defined(__aarch64__)
+        else
+            qemu = "qemu-aarch64-static";
+#endif
+    }
     const char *sr = getenv("WETYPE_SYSROOT");
     sysroot = sr && *sr ? sr : eng + "/sysroot";
     const char *xdg = getenv("XDG_DATA_HOME");
@@ -220,24 +226,22 @@ public:
             int logFd = open(logPath, O_WRONLY | O_CREAT | O_APPEND, 0600);
             if (logFd >= 0) { dup2(logFd, 2); close(logFd); }
             std::string libPath = eng + "/lib";
-#if defined(__aarch64__)
-            // Native bionic libc/liblog/libc++ come from the bundled sysroot.
-            libPath += ":" + sysroot + "/system/lib64";
-#endif
+            // Native run: bionic libc/liblog/libc++ come from the bundled sysroot.
+            if (qemu.empty()) libPath += ":" + sysroot + "/system/lib64";
             setenv("LD_LIBRARY_PATH", libPath.c_str(), 1);
             setenv("WETYPE_DICT_DIR", dicts.c_str(), 1);
             setenv("WETYPE_ASSET_DIR", dicts.c_str(), 1);
             setenv("WETYPE_WORK_DIR", work.c_str(), 1);
-#if defined(__aarch64__)
-            // ARM64 host: exec the harness directly. Its ELF interpreter is set at
-            // install time to the bundled sysroot/system/bin/linker64 (patchelf).
-            execl((eng + "/wetype-harness").c_str(), (eng + "/wetype-harness").c_str(),
-                  (eng + "/lib/libwxhld_jni.so").c_str(), "--daemon", (char *)nullptr);
-#else
-            execlp(qemu.c_str(), qemu.c_str(), "-L", sysroot.c_str(),
-                   (eng + "/wetype-harness").c_str(),
-                   (eng + "/lib/libwxhld_jni.so").c_str(), "--daemon", (char *)nullptr);
-#endif
+            if (qemu.empty()) {
+                // ARM64 host: exec the harness directly. Its ELF interpreter is set at
+                // install time to the bundled sysroot/system/bin/linker64 (patchelf).
+                execl((eng + "/wetype-harness").c_str(), (eng + "/wetype-harness").c_str(),
+                      (eng + "/lib/libwxhld_jni.so").c_str(), "--daemon", (char *)nullptr);
+            } else {
+                execlp(qemu.c_str(), qemu.c_str(), "-L", sysroot.c_str(),
+                       (eng + "/wetype-harness").c_str(),
+                       (eng + "/lib/libwxhld_jni.so").c_str(), "--daemon", (char *)nullptr);
+            }
             _exit(127);
         }
         close(inP[0]);

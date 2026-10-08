@@ -98,4 +98,4 @@ python3 scripts/bench_candidate_latency.py --engine-dir /opt/wetype/arm64 --nati
 - 同一台板子上的 fcitx5 端到端测试（隔离的 D-Bus + fcitx5 5.1.7 + 原生 harness）全部通过：分页 19/19，标点 24/24，英文释义 21/21，异步空格 20/20。引擎守护进程回归 5/5（原生）。
 - fcitx5 为交叉编译产物（ubuntu:20.04 容器内，目标 focal arm64）。使用 5.1.7 而非 5.1.19，因为 gcc-10 不支持 5.1.19 需要的 `<source_location>`。编译时去掉了 spell 模块的词典下载和 appdata 生成步骤。这些是测试构建的取舍，不影响候选逻辑。交叉编译脚本未纳入仓库。
 - 板子使用的 fcitx5 运行时依赖：`libjson-c4`（需额外安装），其余（dbus、uuid、uv、xkbcommon、expat、systemd）由 focal 提供。
-- ARM64 宿主的安装器还没有实现：需要在安装时用 patchelf 修改 harness 的解释器，目前只在开发板上手动完成。
+- 本报告中的板子引擎是手动用 patchelf 处理的。之后 ARM64 AppImage 的安装器已实现这一步（`install` 时执行 `patchelf --set-interpreter`），并在同一块板子上用安装后的引擎重跑了回归和 e2e。
