@@ -87,7 +87,7 @@ print_existing_paths() {
 # Check everything up front and print a copy-paste command; never install packages ourselves.
 check_install_deps() {
   local missing=() cmd tool id=
-  for tool in python3 patchelf unzip sha256sum; do
+  for tool in python3 unzip sha256sum; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
   done
   if [ -z "$apk" ] && ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
@@ -100,11 +100,10 @@ check_install_deps() {
     id="$(. /etc/os-release; echo " ${ID:-} ${ID_LIKE:-} ")"
   fi
   case "$id" in
-    *" debian "*|*" ubuntu "*) cmd="sudo apt install python3 patchelf unzip curl" ;;
-    *" arch "*) cmd="sudo pacman -S --needed python patchelf unzip curl" ;;
-    *" fedora "*|*" rhel "*|*" centos "*)
-      cmd="sudo dnf install python3 patchelf unzip curl（RHEL/CentOS 上 patchelf 来自 EPEL）" ;;
-    *" suse "*|*" opensuse "*) cmd="sudo zypper install python3 patchelf unzip curl" ;;
+    *" debian "*|*" ubuntu "*) cmd="sudo apt install python3 unzip curl" ;;
+    *" arch "*) cmd="sudo pacman -S --needed python unzip curl" ;;
+    *" fedora "*|*" rhel "*|*" centos "*) cmd="sudo dnf install python3 unzip curl" ;;
+    *" suse "*|*" opensuse "*) cmd="sudo zypper install python3 unzip curl" ;;
   esac
   if [ -n "${cmd:-}" ]; then
     echo "请先运行：$cmd" >&2
@@ -117,8 +116,8 @@ check_install_deps() {
 if [ "$action" = install ]; then
   for required in \
     "$src_eng/wetype-harness" "$src_eng/wetype-ime-demo.sh" \
-    "$src_eng/lib/libwetype-shim.so" "$src_eng/lib/libz.so.1" \
-    "$src_eng/qemu-aarch64-static" "$src_eng/sysroot/lib/ld-linux-aarch64.so.1" \
+    "$src_eng/lib/libandroid.so" \
+    "$src_eng/qemu-aarch64-static" "$src_eng/sysroot/system/bin/linker64" \
     "$src_scripts/prepare_assets.sh" "$src_scripts/10_patch_libs.sh" \
     "$src/lib/fcitx5/libfcitx5-wetype.so" \
     "$src/share/fcitx5/addon/wetype.conf" \

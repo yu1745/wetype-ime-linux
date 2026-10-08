@@ -13,12 +13,12 @@ DICTS="${WETYPE_DICT_DIR:-$ENG/dicts}"
 [ -d "$DICTS" ] || DICTS="$ENG/.deps/wechat-ime/assets/config/beta"   # source checkout
 WORK="${WETYPE_WORK_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/wetype-ime/dict}"
 QEMU="${QEMU_AARCH64:-}"
-if [ -z "$QEMU" ]; then   # 安装包自带 QEMU/ARM64 glibc，源码树回落到系统包
+if [ -z "$QEMU" ]; then   # 安装包自带 QEMU，源码树回落到系统包
   if [ -x "$ENG/qemu-aarch64-static" ]; then QEMU="$ENG/qemu-aarch64-static"; else QEMU=qemu-aarch64-static; fi
 fi
 SYSROOT="${WETYPE_SYSROOT:-}"
-if [ -z "$SYSROOT" ]; then
-  if [ -f "$ENG/sysroot/lib/ld-linux-aarch64.so.1" ]; then SYSROOT="$ENG/sysroot"; else SYSROOT=/usr/aarch64-linux-gnu; fi
+if [ -z "$SYSROOT" ]; then   # bionic 运行时：安装目录 sysroot/，源码树 runtime/sysroot/
+  if [ -d "$ENG/sysroot/system" ]; then SYSROOT="$ENG/sysroot"; else SYSROOT="$ENG/runtime/sysroot"; fi
 fi
 
 mkdir -p "$WORK/userdict/v5" "$WORK/userdict/user_hot_word"
@@ -29,7 +29,7 @@ for ((i=0; i<${#WORD}; i++)); do CMDS+="|L ${WORD:$i:1}"; done
 CMDS+="|Q"
 
 printf '%b\n' "${CMDS//|/\\n}" | \
-  env LD_LIBRARY_PATH="$LIBDIR" WETYPE_LIB_DIR="$LIBDIR" WETYPE_DICT_DIR="$DICTS" \
+  env LD_LIBRARY_PATH="$LIBDIR" WETYPE_DICT_DIR="$DICTS" \
       WETYPE_WORK_DIR="$WORK" \
   "$QEMU" -L "$SYSROOT" "$HARNESS" "$([ -f "$LIBDIR/libwxhld_jni.so" ] && echo "$LIBDIR/libwxhld_jni.so" || echo runtime/libwxhld_jni.so)" --daemon 2>/dev/null | \
   while IFS= read -r line; do

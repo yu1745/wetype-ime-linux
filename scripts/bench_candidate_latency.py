@@ -45,7 +45,6 @@ class Daemon:
         env = os.environ.copy()
         env.update({
             "LD_LIBRARY_PATH": f"{args.engine_dir}/lib",
-            "WETYPE_LIB_DIR": f"{args.engine_dir}/lib",
             "WETYPE_DICT_DIR": f"{args.engine_dir}/dicts",
             "WETYPE_ASSET_DIR": f"{args.engine_dir}/dicts",
             "WETYPE_WORK_DIR": work_dir,
@@ -216,7 +215,8 @@ def main() -> int:
     parser.add_argument("--engine-dir", type=Path, default=Path("/usr/lib/wetype-ime/arm64"))
     parser.add_argument("--harness", type=Path, default=None)
     parser.add_argument("--qemu", default="qemu-aarch64-static")
-    parser.add_argument("--sysroot", default="/usr/aarch64-linux-gnu")
+    parser.add_argument("--sysroot", default=None,
+                        help="bionic runtime passed to qemu -L (default: <engine-dir>/sysroot)")
     parser.add_argument("--min-length", type=int, default=1,
                         help="shortest length included in the summary")
     parser.add_argument("--max-length", type=int, default=60)
@@ -232,6 +232,7 @@ def main() -> int:
     args = parser.parse_args()
     args.engine_dir = args.engine_dir.resolve()
     args.harness = (args.harness or args.engine_dir / "wetype-harness").resolve()
+    args.sysroot = args.sysroot or str(args.engine_dir / "sysroot")
     if not 1 <= args.min_length <= args.max_length <= 500:
         parser.error("need 1 <= --min-length <= --max-length <= 500")
     if args.reps < 1 or args.warmup < 0:

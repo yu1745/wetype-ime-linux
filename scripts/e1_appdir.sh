@@ -2,8 +2,8 @@
 # e1_appdir.sh — 组装 WeType 输入法 AppDir（对齐 doubao-ime-linux b1 布局）
 # AppDir 只含本项目自己的代码（Paper 式）：不含任何 APK 里的库或词库。
 # 结构:
-#   AppDir/usr/lib/wetype-ime/arm64/{lib/{libwetype-shim.so,libz.so.1},wetype-harness,wetype-ime-demo.sh}
-#   AppDir/usr/lib/wetype-ime/arm64/{qemu-aarch64-static,sysroot/lib/}  QEMU + ARM64 glibc（第三方，可再分发）
+#   AppDir/usr/lib/wetype-ime/arm64/{lib/libandroid.so,wetype-harness,wetype-ime-demo.sh}
+#   AppDir/usr/lib/wetype-ime/arm64/{qemu-aarch64-static,sysroot/system/}  QEMU + AOSP bionic 运行时（第三方，可再分发）
 #   AppDir/usr/lib/wetype-ime/scripts/  安装时下载官方 APK、校验 SHA-256 并在本机打补丁
 #   AppDir/usr/bin/{wetype-ime-engine,wetype-demo}
 #   AppDir/usr/lib/fcitx5/libfcitx5-wetype.so
@@ -12,10 +12,9 @@ set -e
 BASE="$(cd "$(dirname "$0")/.." && pwd)"     # wetype-ime-linux 根
 APPDIR="$BASE/AppDir"
 ENG="$APPDIR/usr/lib/wetype-ime/arm64"
-PATCH_SCRIPTS="prepare_assets.sh 10_patch_libs.sh versym_surgery.py 12_rename_syms.py
-  promote_shim.py 17_disable_scan_sig.py 21_fake_appender.py"
+PATCH_SCRIPTS="prepare_assets.sh 10_patch_libs.sh 17_disable_scan_sig.py 21_fake_appender.py"
 
-# Build the project's own ARM64 shim and harness (no APK input needed).
+# Build the project's own ARM64 pieces and extract the bionic runtime (no APK input needed).
 bash "$BASE/scripts/20_build.sh"
 
 # Package the host Fcitx5 addon along with the ARM64 engine.
@@ -31,38 +30,46 @@ mkdir -p "$ENG/lib" "$APPDIR/usr/lib/wetype-ime/scripts" "$APPDIR/usr/bin" \
          "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 
 # 1. 自有 ARM64 组件 + demo；WeType 引擎库与词库由 install 在用户机器上生成
-cp "$BASE/runtime/libwetype-shim.so" "$BASE/runtime/libz.so.1" "$ENG/lib/"
+cp "$BASE/runtime/libandroid.so" "$ENG/lib/"
 cp "$BASE/harness/jinterop" "$ENG/wetype-harness"
 cp "$BASE/src/wetype-ime-demo.sh" "$ENG/"
 chmod +x "$ENG/wetype-ime-demo.sh"
 
-# 1b. 第三方运行时：静态 QEMU user 模式 + 最小 ARM64 glibc（均可再分发，见 THIRD-PARTY）
+# 1b. 第三方运行时：静态 QEMU user 模式 + AOSP bionic（均可再分发，见 THIRD-PARTY）
 QEMU_BIN="${QEMU_AARCH64:-$(command -v qemu-aarch64-static || true)}"
-SYSROOT_SRC="${WETYPE_SYSROOT:-/usr/aarch64-linux-gnu}"
 [ -n "$QEMU_BIN" ] && [ -x "$QEMU_BIN" ] || { echo "Missing qemu-aarch64-static (qemu-user-static)" >&2; exit 1; }
 file -L "$QEMU_BIN" | grep -q 'static' || { echo "$QEMU_BIN is not statically linked" >&2; exit 1; }
 cp -L "$QEMU_BIN" "$ENG/qemu-aarch64-static"
-mkdir -p "$ENG/sysroot/lib"
-for so in ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0; do
-  [ -f "$SYSROOT_SRC/lib/$so" ] || { echo "Missing ARM64 glibc: $SYSROOT_SRC/lib/$so (libc6-arm64-cross)" >&2; exit 1; }
-  cp -L "$SYSROOT_SRC/lib/$so" "$ENG/sysroot/lib/"
-done
+cp -a "$BASE/runtime/sysroot" "$ENG/sysroot"
 pkg_version() { dpkg-query -W -f '${Version}' "$1" 2>/dev/null || echo unknown; }
 mkdir -p "$APPDIR/usr/share/doc/wetype-ime"
+cp "$BASE/licenses/Apache-2.0.txt" "$APPDIR/usr/share/doc/wetype-ime/"
+cp "$BASE/licenses/jni/README.md" "$APPDIR/usr/share/doc/wetype-ime/JNI-SOURCE.md"
 cat > "$APPDIR/usr/share/doc/wetype-ime/THIRD-PARTY.md" <<NOTICE
 # Third-party components bundled in this AppImage
 
-| Component | Files | License | Version (Debian/Ubuntu package) |
-|---|---|---|---|
-| QEMU user mode | usr/lib/wetype-ime/arm64/qemu-aarch64-static | GPL-2.0 | qemu-user-static $(pkg_version qemu-user-static) |
-| GNU C Library (ARM64) | usr/lib/wetype-ime/arm64/sysroot/lib/* | LGPL-2.1-or-later | libc6-arm64-cross $(pkg_version libc6-arm64-cross) |
-| zlib (ARM64) | usr/lib/wetype-ime/arm64/lib/libz.so.1 | Zlib | zlib1g:arm64 $(pkg_version zlib1g:arm64) |
+| Component | Files | License |
+|---|---|---|
+| QEMU user mode | usr/lib/wetype-ime/arm64/qemu-aarch64-static | GPL-2.0 |
+| AOSP JNI declarations used by harness | wetype-harness (source: harness/jni.h) | Apache-2.0; full text: Apache-2.0.txt, provenance: JNI-SOURCE.md |
+| Android bionic (linker, libc, libm, libdl) | usr/lib/wetype-ime/arm64/sysroot/system/bin/linker64, system/lib64/{libc,libm,libdl,ld-android}.so | BSD-style, Apache-2.0 |
+| Android liblog | usr/lib/wetype-ime/arm64/sysroot/system/lib64/liblog.so | Apache-2.0 |
+| LLVM libc++ (liblog dependency) | usr/lib/wetype-ime/arm64/sysroot/system/lib64/libc++.so | NCSA / MIT |
+| zlib | usr/lib/wetype-ime/arm64/sysroot/system/lib64/libz.so | Zlib |
 
-These binaries are unmodified copies from the build host's distribution packages.
-Corresponding source code is available from the distribution's source archive
-(for Ubuntu: \`apt-get source qemu cross-toolchain-base zlib\` with the versions above,
-or https://launchpad.net/ubuntu/+source/qemu, /cross-toolchain-base, /zlib), and from
-https://www.qemu.org, https://www.gnu.org/software/libc and https://zlib.net.
+QEMU is an unmodified copy of the build host's qemu-user-static $(pkg_version qemu-user-static)
+package; corresponding source is available from the distribution's source archive
+(for Ubuntu: \`apt-get source qemu\`, or https://launchpad.net/ubuntu/+source/qemu) and from
+https://www.qemu.org.
+
+The Android components are unmodified files from Google's AOSP Android 9 emulator system
+image (system-images;android-28;default;arm64-v8a, arm64-v8a-28_r02, build PSR1.210301.009.B6).
+Their notices are in usr/lib/wetype-ime/arm64/sysroot/NOTICE: the image's own notices for
+libc, liblog, libc++ and zlib, plus notices for linker64, ld-android, libm and libdl
+generated from platform/bionic tag android-9.0.0_r61 (last Android 9 tag), which the image
+does not list.
+Source code: https://android.googlesource.com (platform/bionic, platform/system/core,
+platform/external/libcxx, platform/external/zlib).
 
 WeType (微信输入法) itself is NOT included: its libraries and dictionaries are downloaded
 from Tencent's server and patched on the user's machine at install time.
@@ -83,7 +90,6 @@ USRDATA="\${XDG_DATA_HOME:-\$HOME/.local/share}/wetype-ime"
 mkdir -p "\$USRDATA/dict/userdict/v5" "\$USRDATA/dict/userdict/user_hot_word"
 QEMU="\${QEMU_AARCH64:-\$ENG/qemu-aarch64-static}"
 exec env LD_LIBRARY_PATH="\$ENG/lib" \\
-         WETYPE_LIB_DIR="\$ENG/lib" \\
          WETYPE_DICT_DIR="\$ENG/dicts" \\
          WETYPE_ASSET_DIR="\$ENG/dicts" \\
          WETYPE_WORK_DIR="\$USRDATA/dict" \\

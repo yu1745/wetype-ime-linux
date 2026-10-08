@@ -18,26 +18,34 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          # The runner's third-party apt sources would fail on arm64 indexes; the build does not need them.
-          sudo rm -f /etc/apt/sources.list.d/*.list
-          # Ubuntu serves arm64 packages from ports.ubuntu.com only.
-          sudo sed -i '/^Types:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
-          printf '%s\n' 'Types: deb' 'URIs: http://ports.ubuntu.com/ubuntu-ports' \
-            'Suites: noble noble-updates noble-security' 'Components: main universe' \
-            'Architectures: arm64' 'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' |
-            sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources >/dev/null
-          sudo dpkg --add-architecture arm64
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake libfcitx5core-dev patchelf binutils file \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu qemu-user-static libc6-arm64-cross \
-            zlib1g:arm64 python3 unzip curl ca-certificates
+            build-essential cmake libfcitx5core-dev file qemu-user-static e2fsprogs \
+            python3 unzip curl ca-certificates
+
+      - name: Cache pinned Android NDK
+        uses: actions/cache@v4
+        with:
+          path: .deps/tools/android-ndk-r27c
+          key: ndk-r27c-linux-x86_64-27.2.12479018
+
+      - name: Prepare pinned Android NDK
+        run: |
+          bash scripts/prepare_ndk.sh
+          echo "ANDROID_NDK_HOME=$PWD/.deps/tools/android-ndk-r27c" >> "$GITHUB_ENV"
+
+      - name: Cache AOSP system image
+        uses: actions/cache@v4
+        with:
+          path: .deps/aosp
+          key: aosp-arm64-v8a-28_r02
 
       - name: Build AppImage
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'   # no FUSE on the runner
         run: |
           scripts/e2_img.sh
+          ctest --test-dir fcitx5-wetype/build --output-on-failure
           sha256sum WeTypeIME-Engine-x86_64.AppImage > WeTypeIME-Engine-x86_64.AppImage.sha256
           cat WeTypeIME-Engine-x86_64.AppImage.sha256
 

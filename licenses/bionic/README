@@ -1,0 +1,9 @@
+Copyright notices for the bionic files bundled from the AOSP Android 9 system image
+that the image's own NOTICE.txt does not list: linker64 and ld-android.so
+(linker.NOTICE), libm.so (libm.NOTICE) and libdl.so (libdl.NOTICE).
+
+Generated from platform/bionic at tag android-9.0.0_r61, the last Android 9 release tag
+(the emulator image's build PSR1.210301.009.B6 has no bionic tag of its own), by running
+that tag's libc/tools/generate-NOTICE.py (ported to Python 3, output unchanged) on the
+linker, libm and libdl directories. scripts/prepare_bionic.sh appends them to the NOTICE
+shipped next to the files.

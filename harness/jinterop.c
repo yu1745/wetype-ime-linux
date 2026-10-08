@@ -5,8 +5,8 @@
  *  - jobject = JObj{类名, 字段表}，字段值是我们罐头数据（canned）
  *  - jfieldID/jmethodID = 指向 token 结构的指针
  *  - 未实现的 JNIEnv 槽位 = 记日志的 stub（返回 0），跑一轮就知道胶水要什么
- *  - FindClass/GetFieldID/GetObjectField/GetStringUTFChars 是实测确认的槽位
- *    （6 / 94 / 95 / 169），其余按标准 JNI 表填，双保险槽位重复挂载 */
+ *  - 槽位号由 jni.h（AOSP libnativehelper）的 JNINativeInterface 字段偏移得出，
+ *    按函数名挂载，不手写数字 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -20,6 +20,8 @@
 #include <stdarg.h>
 #include <pthread.h>
 #include <poll.h>
+#include <stddef.h>
+#include "jni.h"
 
 #define ENV_SLOTS 300
 
@@ -425,6 +427,11 @@ static void *F_NewLocalRef(void *env, void *o) { return o; }
 static void *F_ExceptionOccurred(void *env) { return NULL; }
 static void F_ExceptionClear(void *env) { }
 static unsigned char F_ExceptionCheck(void *env) { return 0; }
+/* 静态 void 回调（WxhldApi.onBatchEvent / onReportEngineException）：候选由 harness
+   自己的 native 监听器接收，这里空实现；不读参数，可同时挂 ...、V、A 三种变体。 */
+static void F_CallStaticVoidMethod(void *env, void *cls, JIDToken *id, ...) {
+    LOG("CallStaticVoidMethod(%s.%s)\n", cls_name(cls), id ? id->name : "?");
+}
 /* 伪 JavaVM：JNI_OnLoad 会调 GetEnv（槽 6，双重间接同 JNIEnv） */
 static void *g_env;            /* 前向声明：定义在 env 布表区 */
 static void tab_v(int i, void *fn);
@@ -444,13 +451,16 @@ static long V_AttachCurrentThread(void *vm, void **penv, void *args) {
 }
 static long V_DetachCurrentThread(void *vm) { return 0; }
 static long V_DestroyJavaVM(void *vm) { return 0; }
+/* 按函数名取 JNI 函数表槽位 */
+#define ENV_SLOT(name) (offsetof(struct JNINativeInterface, name) / sizeof(void *))
+#define VM_SLOT(name) (offsetof(struct JNIInvokeInterface, name) / sizeof(void *))
 static void build_vm(void) {
     for (int i = 0; i < 32; i++) vmtab[i] = (void *)stub_default;
-    tab_v(3, V_DestroyJavaVM);
-    tab_v(4, V_AttachCurrentThread);
-    tab_v(5, V_DetachCurrentThread);
-    tab_v(6, V_GetEnv);
-    tab_v(7, V_AttachCurrentThread);
+    tab_v(VM_SLOT(DestroyJavaVM), V_DestroyJavaVM);
+    tab_v(VM_SLOT(AttachCurrentThread), V_AttachCurrentThread);
+    tab_v(VM_SLOT(DetachCurrentThread), V_DetachCurrentThread);
+    tab_v(VM_SLOT(GetEnv), V_GetEnv);
+    tab_v(VM_SLOT(AttachCurrentThreadAsDaemon), V_AttachCurrentThread);
     vmptr = vmtab;
 }
 typedef long (*onload_fn)(void *vm, void *reserved);
@@ -512,7 +522,6 @@ static void *F_GetObjectClass(void *env, void *o) {
     LOG("  -> %p\n", r);
     return r;
 }
-static void *F_NewObjectV(void *env, void *cls, void *mid, void *args) { LOG("NewObjectV(%s)\n", cls_name(cls)); return NULL; }
 static long F_GetVersion(void *env) { return 0x00010006; /* JNI 1.6 */ }
 static long F_EnsureLocalCapacity(void *env, long n) { return 0; }
 static long F_PushLocalFrame(void *env, long n) { return 0; }
@@ -550,54 +559,67 @@ static void tab(int i, void *fn) { if (i >= 0 && i < ENV_SLOTS) envtab[i] = fn; 
 static void build_env(void) {
     for (int i = 0; i < ENV_SLOTS; i++) envtab[i] = (void *)stub_default;
     envptr = envtab;
-    tab(3,  F_GetVersion);
-    tab(4,  F_GetVersion);                    /* 双保险 */
-    tab(5,  F_FindClass); tab(6, F_FindClass); /* 观测确认 6 */
-    tab(20, F_NewGlobalRef);
-    tab(21, F_DeleteGlobalRef);
-    tab(22, F_DeleteLocalRef);
-    tab(23, F_NewLocalRef);
-    tab(14, F_ExceptionOccurred);
-    tab(16, F_ExceptionClear);
-    tab(25, F_ExceptionCheck);
-    tab(31, F_GetObjectClass);
-    tab(32, F_GetMethodID); tab(33, F_GetMethodID);   /* 观测未定，双挂 */
-    tab(34, F_CallObjectMethod);
-    tab(61, F_CallVoidMethod); tab(60, F_CallVoidMethod);
-    tab(49, F_CallIntMethod);
-    tab(93, F_GetStaticFieldID);
-    tab(94, F_GetFieldID);                     /* 观测确认 */
-    tab(95, F_GetObjectField);                 /* 观测确认 */
-    tab(96, F_GetBooleanField);
-    tab(100, F_GetIntField);
-    tab(101, F_GetLongField);
-    tab(102, F_GetFloatField);
-    tab(167, F_NewStringUTF);
-    tab(169, F_GetStringUTFChars);             /* 观测确认 */
-    tab(170, F_ReleaseStringUTFChars);
-    tab(171, F_GetArrayLength);
-    /* 标准 JNI 表：Set* 段 104..112（之前错位 +2，导致胶水层字段写入全丢） */
-    tab(104, F_SetObjectField);
-    tab(105, F_SetBooleanField);
-    tab(109, F_SetIntField);
-    tab(110, F_SetLongField);
-    tab(111, F_SetFloatField);
-    tab(172, F_NewObjectArray);
-    tab(173, F_GetObjectArrayElement);
-    tab(174, F_SetObjectArrayElement);
-    tab(26,  F_AllocObject);
-    tab(27,  F_NewObject); tab(28, F_NewObject); tab(29, F_NewObject);
-    tab(113, F_GetStaticMethodID);
-    tab(142, F_GetStaticObjectField);
-    tab(143, F_GetStaticIntField);
-    tab(208, F_SetByteArrayRegion);
-    tab(230, F_GetDirectBufferAddress);
-    tab(215, F_RegisterNatives);
-    tab(232, F_GetObjectRefType);
-    tab(176, F_NewByteArray);
-    tab(184, F_GetByteArrayElements);
-    tab(186, F_ReleaseByteArrayElements);
-    tab(219, F_GetJavaVM);
+    tab(ENV_SLOT(GetVersion), F_GetVersion);
+    tab(ENV_SLOT(FindClass), F_FindClass);
+    tab(ENV_SLOT(ExceptionOccurred), F_ExceptionOccurred);
+    tab(ENV_SLOT(ExceptionClear), F_ExceptionClear);
+    tab(ENV_SLOT(ExceptionCheck), F_ExceptionCheck);
+    tab(ENV_SLOT(PushLocalFrame), F_PushLocalFrame);
+    tab(ENV_SLOT(PopLocalFrame), F_PopLocalFrame);
+    tab(ENV_SLOT(NewGlobalRef), F_NewGlobalRef);
+    tab(ENV_SLOT(DeleteGlobalRef), F_DeleteGlobalRef);
+    tab(ENV_SLOT(DeleteLocalRef), F_DeleteLocalRef);
+    tab(ENV_SLOT(NewLocalRef), F_NewLocalRef);
+    tab(ENV_SLOT(EnsureLocalCapacity), F_EnsureLocalCapacity);
+    tab(ENV_SLOT(AllocObject), F_AllocObject);
+    /* F_NewObject / F_Call*Method 不读 Java 参数，...、V、A 三种变体共用一个实现 */
+    tab(ENV_SLOT(NewObject), F_NewObject);
+    tab(ENV_SLOT(NewObjectV), F_NewObject);
+    tab(ENV_SLOT(NewObjectA), F_NewObject);
+    tab(ENV_SLOT(GetObjectClass), F_GetObjectClass);
+    tab(ENV_SLOT(GetMethodID), F_GetMethodID);
+    tab(ENV_SLOT(CallObjectMethod), F_CallObjectMethod);
+    tab(ENV_SLOT(CallObjectMethodV), F_CallObjectMethod);
+    tab(ENV_SLOT(CallObjectMethodA), F_CallObjectMethod);
+    tab(ENV_SLOT(CallIntMethod), F_CallIntMethod);
+    tab(ENV_SLOT(CallIntMethodV), F_CallIntMethod);
+    tab(ENV_SLOT(CallIntMethodA), F_CallIntMethod);
+    tab(ENV_SLOT(CallVoidMethod), F_CallVoidMethod);
+    tab(ENV_SLOT(CallVoidMethodV), F_CallVoidMethod);
+    tab(ENV_SLOT(CallVoidMethodA), F_CallVoidMethod);
+    tab(ENV_SLOT(GetFieldID), F_GetFieldID);
+    tab(ENV_SLOT(GetObjectField), F_GetObjectField);
+    tab(ENV_SLOT(GetBooleanField), F_GetBooleanField);
+    tab(ENV_SLOT(GetIntField), F_GetIntField);
+    tab(ENV_SLOT(GetLongField), F_GetLongField);
+    tab(ENV_SLOT(GetFloatField), F_GetFloatField);
+    tab(ENV_SLOT(SetObjectField), F_SetObjectField);
+    tab(ENV_SLOT(SetBooleanField), F_SetBooleanField);
+    tab(ENV_SLOT(SetIntField), F_SetIntField);
+    tab(ENV_SLOT(SetLongField), F_SetLongField);
+    tab(ENV_SLOT(SetFloatField), F_SetFloatField);
+    tab(ENV_SLOT(GetStaticMethodID), F_GetStaticMethodID);
+    tab(ENV_SLOT(CallStaticVoidMethod), F_CallStaticVoidMethod);
+    tab(ENV_SLOT(CallStaticVoidMethodV), F_CallStaticVoidMethod);
+    tab(ENV_SLOT(CallStaticVoidMethodA), F_CallStaticVoidMethod);
+    tab(ENV_SLOT(GetStaticFieldID), F_GetStaticFieldID);
+    tab(ENV_SLOT(GetStaticObjectField), F_GetStaticObjectField);
+    tab(ENV_SLOT(GetStaticIntField), F_GetStaticIntField);
+    tab(ENV_SLOT(NewStringUTF), F_NewStringUTF);
+    tab(ENV_SLOT(GetStringUTFChars), F_GetStringUTFChars);
+    tab(ENV_SLOT(ReleaseStringUTFChars), F_ReleaseStringUTFChars);
+    tab(ENV_SLOT(GetArrayLength), F_GetArrayLength);
+    tab(ENV_SLOT(NewObjectArray), F_NewObjectArray);
+    tab(ENV_SLOT(GetObjectArrayElement), F_GetObjectArrayElement);
+    tab(ENV_SLOT(SetObjectArrayElement), F_SetObjectArrayElement);
+    tab(ENV_SLOT(NewByteArray), F_NewByteArray);
+    tab(ENV_SLOT(GetByteArrayElements), F_GetByteArrayElements);
+    tab(ENV_SLOT(ReleaseByteArrayElements), F_ReleaseByteArrayElements);
+    tab(ENV_SLOT(SetByteArrayRegion), F_SetByteArrayRegion);
+    tab(ENV_SLOT(RegisterNatives), F_RegisterNatives);
+    tab(ENV_SLOT(GetJavaVM), F_GetJavaVM);
+    tab(ENV_SLOT(GetDirectBufferAddress), F_GetDirectBufferAddress);
+    tab(ENV_SLOT(GetObjectRefType), F_GetObjectRefType);
 }
 
 static JObj g_sesscfg;   /* daemon 重建会话复用 */
@@ -906,6 +928,14 @@ static void run_daemon(void *h, long sid) {
 /* ---------- main ---------- */
 typedef int (*init_fn)(void *env, void *thiz, void *info);
 
+/* 打印全部模块基址（崩溃地址归因用） */
+static int print_module(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size; (void)data;
+    if (info->dlpi_name && *info->dlpi_name)
+        printf("[map] %p %s\n", (void *)info->dlpi_addr, info->dlpi_name);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -921,15 +951,6 @@ int main(int argc, char **argv) {
     g_verbose = argc > 2 ? atoi(argv[2]) : 1;
     if (g_daemon_mode) g_verbose = 0;
 
-    {
-        char shimpath[1024];
-        const char *libdir = getenv("WETYPE_LIB_DIR");
-        if (g_daemon_mode && libdir && *libdir)
-            snprintf(shimpath, sizeof shimpath, "%s/libwetype-shim.so", libdir);
-        else
-            snprintf(shimpath, sizeof shimpath, "runtime/libwetype-shim.so");
-        dlopen(shimpath, RTLD_NOW | RTLD_GLOBAL); /* 提升到全局：引擎 dlsym("free") 命中 mmap 感知版 */
-    }
     void *h = dlopen(jni_lib, RTLD_NOW);
     if (!h) { printf("dlopen %s FAILED: %s\n", jni_lib, dlerror()); return 1; }
     printf("dlopen ok: %s\n", jni_lib);
@@ -941,16 +962,8 @@ int main(int argc, char **argv) {
     build_env();
     build_vm();
 
-    /* 打印全部模块基址（崩溃地址归因用） */
-    {
-        struct link_map *lm = NULL;
-        if (!dlinfo(h, RTLD_DI_LINKMAP, &lm) && lm) {
-            for (; lm; lm = lm->l_next)
-                if (lm->l_name && *lm->l_name)
-                    printf("[map] %p %s\n", (void *)lm->l_addr, lm->l_name);
-            fflush(stdout);
-        }
-    }
+    dl_iterate_phdr(print_module, NULL);
+    fflush(stdout);
     build_vm();
 
     /* 先走 JNI_OnLoad（注册日志回调/Native 方法表），再调 initialize */

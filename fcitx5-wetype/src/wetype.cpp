@@ -152,15 +152,13 @@ static void resolveDirs(std::string &eng, std::string &dicts, std::string &work,
         }
     }
     dicts = getenv("WETYPE_DICT_DIR") ? getenv("WETYPE_DICT_DIR") : eng + "/dicts";
-    // QEMU 与 ARM64 glibc 随安装一起提供；缺失时回落到系统包
+    // QEMU 随安装一起提供，缺失时回落到系统包；bionic 运行时只随安装提供
     qemu = getenv("QEMU_AARCH64") ? getenv("QEMU_AARCH64") : "";
     if (qemu.empty())
         qemu = ::access((eng + "/qemu-aarch64-static").c_str(), X_OK) == 0
                    ? eng + "/qemu-aarch64-static" : "qemu-aarch64-static";
-    sysroot = getenv("WETYPE_SYSROOT") ? getenv("WETYPE_SYSROOT") : "";
-    if (sysroot.empty())
-        sysroot = ::access((eng + "/sysroot/lib/ld-linux-aarch64.so.1").c_str(), R_OK) == 0
-                      ? eng + "/sysroot" : "/usr/aarch64-linux-gnu";
+    const char *sr = getenv("WETYPE_SYSROOT");
+    sysroot = sr && *sr ? sr : eng + "/sysroot";
     const char *xdg = getenv("XDG_DATA_HOME");
     std::string base = xdg && *xdg ? xdg : std::string(home) + "/.local/share";
     work = getenv("WETYPE_WORK_DIR") ? getenv("WETYPE_WORK_DIR") : base + "/wetype-ime/dict";
@@ -218,7 +216,6 @@ public:
             int logFd = open(logPath, O_WRONLY | O_CREAT | O_APPEND, 0600);
             if (logFd >= 0) { dup2(logFd, 2); close(logFd); }
             setenv("LD_LIBRARY_PATH", (eng + "/lib").c_str(), 1);
-            setenv("WETYPE_LIB_DIR",  (eng + "/lib").c_str(), 1);
             setenv("WETYPE_DICT_DIR", dicts.c_str(), 1);
             setenv("WETYPE_ASSET_DIR", dicts.c_str(), 1);
             setenv("WETYPE_WORK_DIR", work.c_str(), 1);
