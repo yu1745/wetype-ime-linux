@@ -118,6 +118,12 @@ def check(label, cond, detail=""):
 n = fresh()
 check("engine returned enough candidates (>=2*%d+1)" % PS, n >= 2 * PS + 1, "count=%d" % n)
 
+# Glosses decorate the candidate UI only, never its committed text.
+with_glossary = os.environ.get("WETYPE_PAGETEST_GLOSSARY") == "1"
+check("optional English gloss follows fixture presence",
+      any(" hello" in text for _, text in ui_candidates) == with_glossary,
+      "glossary=%s" % with_glossary)
+
 # 1) 未翻页时按数字 1 -> 第一个候选
 before = len(indexes())
 press("1")
@@ -127,6 +133,18 @@ check("page 1 digit-1 commits index 0", len(got) > before and got[-1] == 0,
       "index=%s" % (got[-1] if got else None))
 check("digit-1 emits a nonempty CommitString", bool(commits) and bool(commits[-1]),
       "commits=%s" % commits)
+
+if with_glossary:
+    check("digit selection commits Chinese without gloss", commits == ["你好"],
+          "commits=%s" % commits)
+    fresh()
+    before = len(indexes())
+    ic.SelectCandidate(0)
+    pump(0.8)
+    got = indexes()
+    check("candidate click commits Chinese without gloss",
+          commits == ["你好"] and len(got) > before and got[-1] == 0,
+          "commits=%s" % commits)
 
 # 2) issue #5: 第一页按 '-' 无法后退, 但按键必须被吞掉且不产生上屏
 fresh()
