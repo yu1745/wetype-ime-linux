@@ -1,3 +1,7 @@
+/* 历史不安全实验：裸 free 破坏 iterator 所有权；本 blob 还存在 delete
+ * 透传/x21 保存缺陷，严禁部署。正确修复在 harness，见
+ * docs/engine-iterator-leak.md 与 30_patch_leak.py；以下保留原实验注释。
+ */
 /* leak_cave.S — libwxhld.so 内存泄漏回收蹦床（AArch64，非位置无关要求：
  * 所有寻址 adrp/adr 相对 + 常量立即数，运行于任意加载基址）
  *

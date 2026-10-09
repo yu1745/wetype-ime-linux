@@ -1,3 +1,7 @@
+/* 历史不安全实验，以下 fifo/UAF 假说已被证伪，严禁部署。
+ * 本 blob 漏重放 gc 栈帧首指令，且 delete 透传错误。安全修复在 harness
+ * iterator 所有权；证据见 docs/engine-iterator-leak.md 与 30_patch_leak.py。
+ */
 /* leak_cave2.S — libwxhld.so 泄漏修复蹦床 v2：排空被遗弃的 fifo_scheduler
  *
  * 根因：每搜索创建 2-3 个 async::fifo_scheduler（72B impl + 256B map，分配点
