@@ -4,7 +4,15 @@
  * （否则 LR 全部落到 libc++_shared 的 operator new 里）。
  * 用法：LD_PRELOAD=malloc_trace.so MTRACE_EVERY=5000 …
  * 每 N 次分配向 stderr 打一行总账 + 存活字节最多的调用点。
- * 头部 32B {magic, size, pc, base}；外来块（linker 自举期）直接透传。 */
+ * 头部 32B {magic, size, pc, base}；外来块（linker 自举期）直接透传。
+ *
+ * 增强归因（引擎泄漏攻关新增，均默认关闭）：
+ *  1) free 记账改用「分配时记录的 pc」——每个调用点的 bytes/cnt 变成真实存活
+ *     语义（原来 free 落点与分配点不同就不减，长尾站点被高估）。
+ *  2) MTRACE_BT_MIN=<字节数>：超过该尺寸的 operator new 顺 x29 帧指针链回溯
+ *     （[mtraceBT] 行），把返回地址序列对照 [map] 基址即可得到引擎内调用链。
+ *  3) 同阈值下登记大块（[mtraceBIG] 行随周期 dump 输出块头 40 字节的可见字符
+ *     转储），用于指纹识别泄漏块内容（指针数组/压缩 int/字符串碎片）。 */
 #include <dlfcn.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -32,6 +40,7 @@ static _Atomic long bin_count[NBIN];
 static PCEnt pc_tab[NPC];
 static _Atomic int state;   /* 0=未解析 1=解析中 2=就绪 */
 static unsigned long mtrace_every = 5000;
+static unsigned long bt_min = 0;   /* MTRACE_BT_MIN：>0 时超过此字节数的分配打印回溯+内容抽样 */
 
 static size_t bin_of(size_t n) {
     size_t b = 0;
@@ -91,6 +100,46 @@ static void dump(void) {
     }
 }
 
+static void bt_walk(void) {
+    /* 大分配：展开 x29 帧指针链，打印返回地址序列（模块基址需对照 [map] 行换算） */
+    char line[512];
+    int off = snprintf(line, sizeof line, "[mtraceBT] size>=BT_MIN:\n");
+    emit(line);
+    unsigned long fp = (unsigned long)__builtin_frame_address(0);
+    off = 0;
+    for (int i = 0; i < 16 && fp; i++) {
+        unsigned long *fr = (unsigned long *)fp;
+        /* 帧布局：[fp] = 上级 fp, [fp+8] = lr */
+        if (fr[1] < 0x1000) break;
+        off += snprintf(line + off, sizeof line - off - 1, " %#lx", fr[1]);
+        if (off > 400) break;
+        unsigned long nxt = fr[0];
+        if (nxt <= fp) break;   /* 链必须递增 */
+        fp = nxt;
+    }
+    snprintf(line + off, sizeof line - off - 1, "\n");
+    emit(line);
+}
+/* 大块登记环：周期 dump 时回读内容（字符串线索） */
+#define BIGRING 512
+static struct { unsigned long pc; void *p; size_t n; } big_ring[BIGRING];
+static int big_n = 0;
+static void big_dump(void) {
+    char line[512];
+    int start = big_n > 60 ? big_n - 60 : 0;
+    for (int i = start; i < big_n && i < BIGRING; i++) {
+        unsigned char *q = (unsigned char *)big_ring[i].p;
+        if (!q) continue;
+        int off = snprintf(line, sizeof line, "[mtraceBIG] pc=%#lx n=%zu head:", big_ring[i].pc, big_ring[i].n);
+        for (int k = 0; k < 40 && off < 440; k++) {
+            unsigned char c = q[k];
+            off += snprintf(line + off, sizeof line - off - 1,
+                            (c >= 32 && c < 127) ? "%c" : (c ? " <%02x>" : " \\0"), c);
+        }
+        snprintf(line + off, sizeof line - off - 1, "\n");
+        emit(line);
+    }
+}
 static void count_new(size_t n, unsigned long pc) {
     atomic_fetch_add(&live_bytes, n);
     atomic_fetch_add(&live_objs, 1);
@@ -98,13 +147,14 @@ static void count_new(size_t n, unsigned long pc) {
     PCEnt *e = pc_find(pc, 1);
     if (e) { atomic_fetch_add(&e->bytes, n); atomic_fetch_add(&e->cnt, 1); }
     unsigned long total = atomic_fetch_add(&n_malloc, 1) + 1;
-    if (mtrace_every && total % mtrace_every == 0) dump();
+    if (mtrace_every && total % mtrace_every == 0) { dump(); big_dump(); }
 }
 static void count_del(size_t n, unsigned long pc) {
     atomic_fetch_sub(&live_bytes, n);
     atomic_fetch_sub(&live_objs, 1);
     atomic_fetch_sub(&bin_count[bin_of(n)], 1);
     atomic_fetch_add(&n_free, 1);
+    /* 用分配时记录的 pc 记账：live 语义准确（含小对象长尾） */
     PCEnt *e = pc_find(pc, 0);
     if (e) { atomic_fetch_sub(&e->bytes, n); atomic_fetch_sub(&e->cnt, 1); }
 }
@@ -128,6 +178,8 @@ static void resolve(void) {
     real_realloc = dlsym(RTLD_NEXT, "realloc");
     const char *e = getenv("MTRACE_EVERY");
     if (e) mtrace_every = strtoul(e, NULL, 0);
+    e = getenv("MTRACE_BT_MIN");
+    if (e) bt_min = strtoul(e, NULL, 0);
     atomic_store(&state, 2);
 }
 static int ready(void) {
@@ -141,6 +193,10 @@ static void *tag(void *base, size_t n, unsigned long pc) {
     H *h = (H *)base;
     h->magic = MAGIC; h->size = n; h->base = base; h->pc = pc;
     count_new(n, pc);
+    if (bt_min && n >= bt_min && big_n < BIGRING) {
+        big_ring[big_n].pc = pc; big_ring[big_n].p = (char *)base + HDRSZ; big_ring[big_n].n = n;
+        big_n++;
+    }
     return (char *)base + HDRSZ;
 }
 
