@@ -24,13 +24,13 @@ def disable_core_dumps():
 
 
 class Engine:
-    def __init__(self, root, work, native, qemu, log):
+    def __init__(self, root, work, native, qemu, log, harness=None):
         env = os.environ.copy()
         lib = root / "lib"
         sysroot = root / "sysroot"
         env.update(LD_LIBRARY_PATH=str(lib), WETYPE_DICT_DIR=str(root / "dicts"),
                    WETYPE_ASSET_DIR=str(root / "dicts"), WETYPE_WORK_DIR=str(work))
-        harness = root / "wetype-harness"
+        harness = Path(harness).resolve() if harness else root / "wetype-harness"
         if native:
             # Install-time step on ARM64 hosts: the harness interpreter points at the
             # bundled bionic linker. Patch a temporary copy, never the installed harness.
@@ -122,7 +122,7 @@ def run(args):
         (work / "userdict/user_hot_word").mkdir(parents=True)
         log_path = Path(args.log).resolve() if args.log else Path(directory) / "engine.log"
         with log_path.open("wb") as log:
-            engine = Engine(root, work, args.native, args.qemu, log)
+            engine = Engine(root, work, args.native, args.qemu, log, getattr(args, 'harness', None))
             try:
                 engine.command("PING", "PONG")
                 engine.command("OPT spans", "OK")
@@ -175,7 +175,7 @@ def run(args):
             finally:
                 engine.close()
             # Restart against the same isolated data to prove persistence.
-            engine = Engine(root, work, args.native, args.qemu, log)
+            engine = Engine(root, work, args.native, args.qemu, log, getattr(args, 'harness', None))
             try:
                 engine.command("OPT spans", "OK")
                 words = engine.candidates("nihao")
@@ -195,6 +195,7 @@ if __name__ == "__main__":
     parser.add_argument("--qemu")
     parser.add_argument("--idle-seconds", type=float, default=0)
     parser.add_argument("--log")
+    parser.add_argument("--harness", help="harness binary under test (default: engine-dir/wetype-harness)")
     arguments = parser.parse_args()
     if arguments.idle_seconds < 0:
         parser.error("idle-seconds must be nonnegative")

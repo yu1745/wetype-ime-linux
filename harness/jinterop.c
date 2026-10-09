@@ -6,7 +6,10 @@
  *  - jfieldID/jmethodID = 指向 token 结构的指针
  *  - 未实现的 JNIEnv 槽位 = 记日志的 stub（返回 0），跑一轮就知道胶水要什么
  *  - 槽位号由 jni.h（AOSP libnativehelper）的 JNINativeInterface 字段偏移得出，
- *    按函数名挂载，不手写数字 */
+ *    按函数名挂载，不手写数字
+ * 对象回收：真实 Android 上这些对象是 local ref，native 调用返回后由 GC 回收；
+ * 这里没有 GC，用「登记 + 宽限期回收」模拟（详见 reg_* 注释），否则每次
+ * 按键请求泄漏 ~1-2MB（候选对象 + 回调路径对象），见 scripts/test_memory_leak.py */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -25,12 +28,130 @@
 
 #define ENV_SLOTS 300
 
-typedef struct { const char *name; char type; /* s,i,l,f,z,o */ const void *val; } JField;
+typedef struct { const char *name; char type; /* s,i,l,f,z,o */ char owned; const void *val; } JField;
 typedef struct JObj { unsigned long magic; const char *cls; JField f[48]; int n; } JObj;
 typedef struct { unsigned long magic; unsigned char *data; long len; } JBytes;
 #define JB_MAGIC 0x4a42595445530001UL
 #define JO_MAGIC 0x4a4f424a45435401UL
 typedef struct { const char *name; char type; const char *sig; } JIDToken;   /* jfieldID/jmethodID */
+
+/* ---------- 假 JNI 对象回收 ----------
+ * 此前所有构造出的对象常驻内存（每次按键请求 ~300 个 JObj + id byte[]，
+ * 线性泄漏）。真实 Android 上胶水层构造的对象是 local ref，native 调用
+ * 返回后即可被 GC 回收。这里用登记表 + 宽限期回收模拟：
+ *  1) 所有堆分配（JObj/JArr/JBytes）进登记表，互斥锁保护（引擎回调线程
+ *     也会分配）；
+ *  2) daemon 线程在安全点（B/S/C 命令开头）回收登记时间早于宽限期的对象；
+ *  3) NewGlobalRef 的对象被 pin 住，DeleteGlobalRef 后才可回收（JNI 语义）；
+ *  4) daemon 启动前的登记项（InitInfo/DictInfo 等初始化对象）永不回收；
+ *  5) daemon_fetch_cands 拷走 text/id 后立即释放本轮 candidate 对象
+ *     （candidate_get_n 返回给调用方，引擎不再持有，等同 Android 侧 GC）。
+ * 环境变量：WETYPE_GC_MS 宽限期（默认 3000），WETYPE_GC_OFF=1 关闭回收，
+ * WETYPE_GC_DEBUG=1 打印回收统计。 */
+typedef enum { R_JOBJ, R_JARR, R_JBYTES } RKind;
+typedef struct { void **elem; int len; } JArr;
+typedef struct { void *p; RKind k; long t; int pin; } REnt;
+static pthread_mutex_t g_reg_mu = PTHREAD_MUTEX_INITIALIZER;
+static REnt *g_reg = NULL;
+static size_t g_regn = 0, g_regcap = 0;
+static size_t g_reg_keep_from = 0;   /* daemon 启动时的登记数：之前的永不回收 */
+static long g_gc_grace_ms = 3000;
+static int g_gc_off = 0, g_gc_debug = 0;
+static unsigned long g_gc_freed = 0;
+static unsigned long g_pin_calls = 0;   /* NewGlobalRef 次数（诊断 pin 泄漏） */
+
+static long mono_ms(void);   /* 定义在 daemon 区，这里前向声明 */
+static JBytes *g_last_bytes;  /* 最近创建的 byte[]（String([B) 构造用）；定义提前到回收区 */
+
+static void reg_add(void *p, RKind k) {
+    if (!p) return;
+    pthread_mutex_lock(&g_reg_mu);
+    if (g_regn == g_regcap) {
+        size_t nc = g_regcap ? g_regcap * 2 : 4096;
+        REnt *nr = realloc(g_reg, nc * sizeof(REnt));
+        if (!nr) { pthread_mutex_unlock(&g_reg_mu); return; }   /* 登记失败：宁漏勿死 */
+        g_reg = nr; g_regcap = nc;
+    }
+    g_reg[g_regn].p = p; g_reg[g_regn].k = k;
+    g_reg[g_regn].t = mono_ms(); g_reg[g_regn].pin = 0;
+    g_regn++;
+    pthread_mutex_unlock(&g_reg_mu);
+}
+static long reg_find_locked(void *p) {
+    for (size_t i = 0; i < g_regn; i++) if (g_reg[i].p == p) return (long)i;
+    return -1;
+}
+/* GlobalRef 语义：pin 期间不回收 */
+static void reg_pin(void *p, int delta) {
+    if (!p) return;
+    if (delta > 0) g_pin_calls += delta;
+    pthread_mutex_lock(&g_reg_mu);
+    long i = reg_find_locked(p);
+    if (i >= 0) {
+        g_reg[i].pin += delta;
+        if (g_reg[i].pin < 0) g_reg[i].pin = 0;
+    }
+    pthread_mutex_unlock(&g_reg_mu);
+}
+/* 释放单个对象（已从登记表移除或不会再次扫到） */
+static void reg_free_obj(REnt e) {
+    if (e.k == R_JOBJ) {
+        JObj *o = e.p;
+        for (int i = 0; i < o->n; i++)
+            if (o->f[i].type == 's' && o->f[i].owned) free((void *)o->f[i].val);
+        free(o);
+    } else if (e.k == R_JBYTES) {
+        JBytes *b = e.p;
+        if (b == g_last_bytes) g_last_bytes = NULL;
+        free(b->data); free(b);
+    } else {
+        JArr *a = e.p;
+        free(a->elem); free(a);
+    }
+}
+/* 显式释放（调用方所有权的对象）。pin 住的跳过，交回给宽限期回收。 */
+static int reg_release(void *p) {
+    if (!p) return 0;
+    pthread_mutex_lock(&g_reg_mu);
+    long i = reg_find_locked(p);
+    if (i < 0 || g_reg[i].pin) { pthread_mutex_unlock(&g_reg_mu); return 0; }
+    REnt e = g_reg[i];
+    g_reg[i] = g_reg[g_regn - 1]; g_regn--;
+    pthread_mutex_unlock(&g_reg_mu);
+    reg_free_obj(e);
+    g_gc_freed++;
+    return 1;
+}
+/* 宽限期回收：只在 daemon 主线程的安全点调用。 */
+extern void malloc_trim(size_t) __attribute__((weak));
+static void reg_sweep(void) {
+    if (g_gc_off) return;
+    pthread_mutex_lock(&g_reg_mu);
+    REnt *dead = malloc((g_regn > g_reg_keep_from ? g_regn - g_reg_keep_from : 1) * sizeof(REnt));
+    if (!dead) { pthread_mutex_unlock(&g_reg_mu); return; }
+    long now = mono_ms();
+    size_t nd = 0, w = g_reg_keep_from;
+    size_t pinned = 0;
+    for (size_t i = 0; i < g_regn; i++) if (g_reg[i].pin) pinned++;
+    for (size_t i = g_reg_keep_from; i < g_regn; i++) {
+        REnt e = g_reg[i];
+        if (!e.pin && now - e.t >= g_gc_grace_ms) dead[nd++] = e;
+        else g_reg[w++] = e;
+    }
+    size_t live = w;
+    g_regn = w;
+    pthread_mutex_unlock(&g_reg_mu);
+    for (size_t i = 0; i < nd; i++) reg_free_obj(dead[i]);
+    free(dead);
+    if (nd) {
+        g_gc_freed += nd;
+        if (g_gc_debug)
+            fprintf(stderr, "[gc] freed %zu live %zu pinned %zu total %lu\n", nd, live, pinned, g_gc_freed);
+    } else if (g_gc_debug) {
+        fprintf(stderr, "[gc] freed 0 live %zu pinned %zu total %lu\n", live, pinned, g_gc_freed);
+    }
+    if (malloc_trim) malloc_trim(0);   /* glibc: 归还释放页给 OS；bionic 无此符号则跳过 */
+}
 
 static int g_verbose = 1;
 #define LOG(...) do { if (g_verbose) { printf("[env] " __VA_ARGS__); fflush(stdout);} } while (0)
@@ -42,37 +163,52 @@ static const char *CLS_INITINFO = "com/tencent/wxhld/info/InitInfo";
 /* Java byte[] 模拟 */
 
 /* 有界登记表仅用于事后 dump；运行时类型识别通过 JObj 自身 magic 标记。 */
-static JBytes *g_last_bytes = NULL;   /* 最近创建的 byte[]（String([B) 构造用） */
-static JObj *g_objs[8192];
-static int g_objn = 0;
 static JObj *obj_new(const char *cls) {
     JObj *o = calloc(1, sizeof(JObj));
+    if (!o) return o;
     o->magic = JO_MAGIC;
     o->cls = cls;
-    if (g_objn < 8192) g_objs[g_objn++] = o;
+    reg_add(o, R_JOBJ);
     return o;
 }
 static void dump_all_objs(void) {
-    printf("=== 已构造对象（%d 个，只列有字段的） ===\n", g_objn);
-    for (int i = 0; i < g_objn; i++) {
-        JObj *o = g_objs[i];
+    printf("=== 已构造对象（%zu 个，只列有字段的） ===\n", g_regn);
+    for (size_t i = 0; i < g_regn; i++) {
+        if (g_reg[i].k != R_JOBJ) continue;
+        JObj *o = g_reg[i].p;
         if (!o || o->n == 0) continue;
-        printf("[obj %d] %s:", i, o->cls ? o->cls : "?");
+        printf("[obj %zu] %s:", i, o->cls ? o->cls : "?");
         for (int k = 0; k < o->n; k++) {
             JField *f = &o->f[k];
             if (f->type == 's') printf(" %s=\"%s\"", f->name, (const char *)f->val);
             else if (f->type == 'i' || f->type == 'l' || f->type == 'z') printf(" %s=%ld", f->name, (long)f->val);
             else if (f->type == 'o') printf(" %s=%p", f->name, f->val);
-            else if (f->type == 'f') printf(" %s=%f", f->name, f->val ? *(const float *)f->val : 0.0f);
+            else if (f->type == 'f') { long b = (long)f->val; float fv; memcpy(&fv, &b, sizeof fv); printf(" %s=%f", f->name, fv); }
         }
         printf("\n");
     }
     fflush(stdout);
 }
-static void obj_set(JObj *o, const char *name, char type, const void *val) {
-    if (o->n >= 48) return;   /* 防越界（胶水层会反复写同一对象） */
-    o->f[o->n].name = name; o->f[o->n].type = type; o->f[o->n].val = val; o->n++;
+/* 同名字段已存在则原地替换（真实 JNI 语义：字段只有一个值）。
+ * owned='s' 缓冲区归 JObj 所有，替换时释放旧值。 */
+static void obj_setf(JObj *o, const char *name, char type, const void *val, char owned) {
+    if (!o) return;
+    for (int i = 0; i < o->n; i++) {
+        if (!strcmp(o->f[i].name, name)) {
+            if (o->f[i].type == 's' && o->f[i].owned && o->f[i].val != val)
+                free((void *)o->f[i].val);
+            o->f[i].type = type; o->f[i].val = val; o->f[i].owned = owned;
+            return;
+        }
+    }
+    if (o->n >= 48) return;   /* 防越界（保险） */
+    o->f[o->n].name = name; o->f[o->n].type = type;
+    o->f[o->n].owned = owned; o->f[o->n].val = val; o->n++;
 }
+static void obj_set(JObj *o, const char *name, char type, const void *val) {
+    obj_setf(o, name, type, val, 0);
+}
+static long f2bits(float x) { long b = 0; memcpy(&b, &x, sizeof x); return b; }
 static JField *obj_get(JObj *o, const char *name) {
     for (int i = 0; i < o->n; i++)
         if (!strcmp(o->f[i].name, name)) return &o->f[i];
@@ -94,8 +230,7 @@ static void *stub_default(void) {
     return 0;
 }
 
-/* 对象数组：JObj 伪装，cls="[L..."，元素存字段里 */
-typedef struct { void **elem; int len; } JArr;
+/* 对象数组：JObj 伪装，cls="[L..."，元素存字段里（定义已提前到回收区） */
 
 
 /* ---- 候选文本提取与顺序 dump ---- */
@@ -205,13 +340,30 @@ static void *F_FindClass(void *env, const char *name) {
     LOG("  -> NULL (注册表满!)\n");
     return NULL;
 }
+/* field/method ID 缓存：同一 (cls,name,sig) 只发一个 token。
+ * 胶水层自身也缓存，但重复查询时不再重复分配，彻底封死 token 泄漏。 */
+static void *token_cache(void *cls, const char *name, const char *sig, char kind) {
+    static struct { void *cls; const char *name; const char *sig; char kind; void *tok; } cache[8192];
+    static int n;
+    for (int i = 0; i < n; i++)
+        if (cache[i].cls == cls && cache[i].kind == kind &&
+            !strcmp(cache[i].name, name) && !strcmp(cache[i].sig, sig ? sig : ""))
+            return cache[i].tok;
+    JIDToken *t = malloc(sizeof(JIDToken));
+    if (!t) return NULL;
+    t->name = strdup(name);
+    t->type = kind;
+    t->sig = strdup(sig ? sig : "");
+    if (n < 8192) {
+        cache[n].cls = cls; cache[n].name = t->name; cache[n].sig = t->sig;
+        cache[n].kind = kind; cache[n].tok = t; n++;
+    }
+    return t;
+}
 static void *F_GetFieldID(void *env, void *cls, const char *name, const char *sig) {
     LOG("GetFieldID(%s, %s, %s)\n", cls_name(cls), name, sig);
-    JIDToken *t = malloc(sizeof(JIDToken));
-    t->name = strdup(name);
-    t->type = sig && sig[0] == 'L' ? 'o' : sig ? sig[0] : 'x';
-    t->sig = strdup(sig ? sig : "");
-    return t;
+    char kind = sig && sig[0] == 'L' ? 'o' : sig ? sig[0] : 'x';
+    return token_cache(cls, name, sig, kind);
 }
 static void *F_GetStaticFieldID(void *env, void *cls, const char *name, const char *sig) {
     return F_GetFieldID(env, cls, name, sig);
@@ -224,22 +376,31 @@ static void *F_GetObjectField(void *env, void *obj, JIDToken *id) {
         if (f->type == 's') return str_obj((const char *)f->val);
         return (void *)f->val;
     }
-    /* auto-complete：缺失字段按签名生成空对象/空串/空数组，杜绝 null 入引擎 */
+    /* auto-complete：缺失字段按签名生成空对象/空串/空数组，杜绝 null 入引擎。
+     * 全部用 pin 住的单例：引擎可能长期持有，重复调用不再新建（防泄漏+防悬空） */
     const char *sig = id ? id->sig : "";
-    if (!strcmp(sig, "Ljava/lang/String;")) return str_obj("");
+    if (!strcmp(sig, "Ljava/lang/String;")) {
+        static JObj *empty_str;
+        if (!empty_str) { empty_str = str_obj(""); reg_pin(empty_str, 1); }
+        return empty_str;
+    }
     if (sig[0] == '[') {
-        static JArr empties[16]; static int en;
-        if (en < 16) { empties[en].elem = NULL; empties[en].len = 0; return &empties[en++]; }
-        return NULL;
+        static JArr empty_arr;   /* 静态：不在登记表，永不被回收 */
+        empty_arr.elem = NULL; empty_arr.len = 0;
+        return &empty_arr;
     }
     if (sig[0] == 'L') {
-        static char clsnames[32][96]; static int cn;
+        static JObj *objs[32]; static const char *sigs[32]; static int cn;
+        for (int i = 0; i < cn; i++) if (!strcmp(sigs[i], sig)) return objs[i];
         if (cn < 32) {
             const char *in = sig + 1;
-            char *dst = clsnames[cn];
-            while (*in && *in != ';') *dst++ = *in++;
-            *dst = 0;
-            return obj_new(clsnames[cn++]);
+            char clsname[96]; int k;
+            for (k = 0; k < 95 && in[k] && in[k] != ';'; k++) clsname[k] = in[k];
+            clsname[k] = 0;
+            JObj *o = obj_new(clsname);
+            reg_pin(o, 1);
+            sigs[cn] = o->cls; objs[cn] = o; cn++;
+            return o;
         }
     }
     return NULL;
@@ -259,7 +420,9 @@ static long F_GetLongField(void *env, void *obj, JIDToken *id) {
 static double F_GetFloatField(void *env, void *obj, JIDToken *id) {
     if (!obj) return 0;
     JField *f = obj_get((JObj *)obj, id->name);
-    return f && f->type == 'f' ? *(const float *)f->val : 0;
+    if (!f || f->type != 'f') return 0;
+    long b = (long)f->val; float fv; memcpy(&fv, &b, sizeof fv);
+    return fv;
 }
 static long F_GetBooleanField(void *env, void *obj, JIDToken *id) {
     if (!obj) return 0;
@@ -284,9 +447,7 @@ static void *F_NewStringUTF(void *env, const char *s) {
 }
 static void *F_GetMethodID(void *env, void *cls, const char *name, const char *sig) {
     LOG("GetMethodID(%s, %s, %s)\n", cls_name(cls), name, sig);
-    JIDToken *t = malloc(sizeof(JIDToken));
-    t->name = strdup(name); t->type = 'm';
-    return t;
+    return token_cache(cls, name, sig, 'm');
 }
 static void *F_CallObjectMethod(void *env, void *obj, JIDToken *id, ...) {
     LOG("CallObjectMethod(%s.%s) -> null\n", obj ? ((JObj *)obj)->cls : "null", id ? id->name : "?");
@@ -300,7 +461,7 @@ static long F_CallIntMethod(void *env, void *obj, JIDToken *id, ...) {
     LOG("CallIntMethod(%s.%s) -> 0\n", obj ? ((JObj *)obj)->cls : "null", id ? id->name : "?");
     return 0;
 }
-static void *F_NewGlobalRef(void *env, void *o) { return o; }
+static void *F_NewGlobalRef(void *env, void *o) { reg_pin(o, 1); return o; }
 /* 判断是否为模拟 jobject。不要依赖 g_objs：那只是有界诊断目录。 */
 static int is_jobj(void *p) {
     if (!p) return 0;
@@ -364,10 +525,7 @@ static void F_SetLongField(void *env, void *obj, JIDToken *id, long v) {
 }
 static void F_SetFloatField(void *env, void *obj, JIDToken *id, double v) {
     LOG("SetFloatField(%s.%s = %f)\n", obj ? ((JObj *)obj)->cls : "null", id ? id->name : "?", v);
-    if (obj) {
-        float fv = (float)v;
-        obj_set((JObj *)obj, id->name, 'f', &fv); /* 注意：栈地址，仅调试用 */
-    }
+    if (obj) obj_set((JObj *)obj, id->name, 'f', (const void *)f2bits((float)v));   /* 值存指针槽，不存地址 */
 }
 static void F_SetBooleanField(void *env, void *obj, JIDToken *id, long v) {
     LOG("SetBooleanField(%s.%s = %ld)\n", obj ? ((JObj *)obj)->cls : "null", id ? id->name : "?", v);
@@ -387,7 +545,7 @@ static void *F_NewObject(void *env, void *cls, void *mid, void *args) {
             char *str = calloc(1, (size_t)n + 1);
             if (b->data && n > 0) memcpy(str, b->data, (size_t)n);
             JObj *o = obj_new("java/lang/String");
-            obj_set(o, ".str", 's', str);
+            obj_setf(o, ".str", 's', str, 1);   /* 拷贝缓冲区归 JObj 所有，随对象释放 */
             printf("[newJstring] \"%s\"\n", str);
             fflush(stdout);
             return o;
@@ -397,9 +555,7 @@ static void *F_NewObject(void *env, void *cls, void *mid, void *args) {
 }
 static void *F_GetStaticMethodID(void *env, void *cls, const char *name, const char *sig) {
     LOG("GetStaticMethodID(%s, %s, %s)\n", cls_name(cls), name, sig);
-    JIDToken *t = malloc(sizeof(JIDToken));
-    t->name = strdup(name); t->type = 'm';
-    return t;
+    return token_cache(cls, name, sig, 'M');
 }
 static void *F_GetStaticObjectField(void *env, void *cls, JIDToken *id) {
     LOG("GetStaticObjectField(%s.%s) -> null\n", cls_name(cls), id ? id->name : "?");
@@ -421,7 +577,7 @@ static long F_RegisterNatives(void *env, void *cls, const JNMethod *methods, lon
     return 0; /* JNI_OK */
 }
 static void *F_GetDirectBufferAddress(void *env, void *buf) { return NULL; }
-static void F_DeleteGlobalRef(void *env, void *o) { }
+static void F_DeleteGlobalRef(void *env, void *o) { reg_pin(o, -1); }
 static void F_DeleteLocalRef(void *env, void *o) { }
 static void *F_NewLocalRef(void *env, void *o) { return o; }
 static void *F_ExceptionOccurred(void *env) { return NULL; }
@@ -477,8 +633,11 @@ static long F_GetArrayLength(void *env, void *arr) {
 static void *F_NewObjectArray(void *env, long len, void *cls, void *init) {
     LOG("NewObjectArray(%ld, %s)\n", len, cls_name(cls));
     JArr *a = malloc(sizeof(JArr));
+    if (!a) return NULL;
     a->len = (int)len;
     a->elem = calloc(len > 0 ? len : 1, sizeof(void *));
+    if (!a->elem) { free(a); return NULL; }
+    reg_add(a, R_JARR);
     return a;
 }
 static void F_SetObjectArrayElement(void *env, void *arr, long idx, void *v) {
@@ -494,7 +653,7 @@ static void dump_obj(JObj *o) {
         if (o->f[i].type == 's') printf("      %s = \"%s\"\n", o->f[i].name, (const char *)o->f[i].val);
         else if (o->f[i].type == 'i' || o->f[i].type == 'l' || o->f[i].type == 'z')
             printf("      %s = %ld\n", o->f[i].name, (long)o->f[i].val);
-        else if (o->f[i].type == 'f') printf("      %s = %f\n", o->f[i].name, *(float *)o->f[i].val);
+        else if (o->f[i].type == 'f') { long b = (long)o->f[i].val; float fv; memcpy(&fv, &b, sizeof fv); printf("      %s = %f\n", o->f[i].name, fv); }
         else if (is_jobj((void *)o->f[i].val)) {
             JObj *sv = (JObj *)o->f[i].val;
             JField *sf = obj_get(sv, ".str");
@@ -531,8 +690,12 @@ static void *F_PopLocalFrame(void *env, void *r) { return r; }
 static void *F_NewByteArray(void *env, long len) {
     LOG("NewByteArray(%ld)\n", len);
     JBytes *b = malloc(sizeof(JBytes));
-    b->magic = JB_MAGIC; b->len = len; b->data = len > 0 ? calloc(1, len) : NULL;
+    if (!b) return NULL;
+    b->magic = JB_MAGIC; b->len = len;
+    b->data = len > 0 ? calloc(1, len) : NULL;
+    if (len > 0 && !b->data) { free(b); return NULL; }
     g_last_bytes = b;
+    reg_add(b, R_JBYTES);
     return b;
 }
 static void F_SetByteArrayRegion(void *env, void *arr, long start, long len, const void *buf) {
@@ -627,31 +790,97 @@ static JObj g_sesscfg;   /* daemon 重建会话复用 */
 /* ---------- daemon：候选缓存与会话管理 ---------- */
 #define MAX_CAND 72
 static char g_ct[MAX_CAND][256];   /* 候选文本 */
-static JBytes *g_cid[MAX_CAND];    /* 候选 id byte[] */
+static unsigned char *g_cid_buf[MAX_CAND];   /* 候选 id 副本（引擎的 id JBytes 会被回收） */
+static JBytes g_cid_obj[MAX_CAND];  /* 包在副本外的 JBytes，select_candidate 用 */
+static JBytes *g_cid[MAX_CAND];    /* 指向 g_cid_obj[i]，无 id 则 NULL */
 static int g_ccover[MAX_CAND];     /* 候选覆盖的输入字母数（cover_input_len） */
 static int g_ct_n = 0;
 static long g_cur_it = 0;          /* 当前 iterator（上一轮取过候选后保留） */
 
-/* 引擎每次最多返回 10 个；连续分批读取并缓存 text+id 供 SEL。 */
+static void cid_copies_clear(void) {
+    for (int i = 0; i < MAX_CAND; i++) {
+        if (g_cid_buf[i]) { free(g_cid_buf[i]); g_cid_buf[i] = NULL; }
+        g_cid_obj[i].magic = JB_MAGIC;
+        g_cid_obj[i].data = NULL;
+        g_cid_obj[i].len = 0;
+        g_cid[i] = NULL;
+    }
+}
+
+/* 引擎每次最多返回 10 个；连续分批读取并缓存 text+id 供 SEL。
+ * text/id 拷贝到自有缓冲后，本轮 candidate 对象立即释放（它们是
+ * candidate_get_n 返回给调用方的，引擎不再持有；宽限期回收只兜底）。 */
 static int daemon_fetch_cands(void *sym_cg, void *sym_dci, long it) {
+    static int max_cand = -1;
+    if (max_cand < 0) {
+        const char *e = getenv("WETYPE_MAX_CAND");
+        long v = e ? atol(e) : MAX_CAND;
+        if (v < 10) v = 10;
+        if (v > MAX_CAND) v = MAX_CAND;
+        max_cand = (int)v;
+    }
+    cid_copies_clear();
     g_ct_n = 0;
     if (!sym_cg || !it) return 0;
-    for (int batch = 0; batch < MAX_CAND / 10 && g_ct_n < MAX_CAND; ++batch) {
+    JArr *batches[MAX_CAND / 10 + 1];
+    int nb = 0;
+    for (int batch = 0; batch < max_cand / 10; ++batch) {
         JArr *a = (JArr *)((void *(*)(void *, void *, long, int))sym_cg)(g_env, NULL, it, 10);
-        if (!a || a->len <= 0) break;
-        const int before = g_ct_n;
-        for (int i = 0; i < a->len && g_ct_n < MAX_CAND; i++) {
+        if (!a) break;
+        batches[nb++] = a;
+        if (a->len < 10) break;
+    }
+    for (int b = 0; b < nb; b++) {
+        JArr *a = batches[b];
+        for (int i = 0; i < a->len && g_ct_n < max_cand; i++) {
             JObj *c = (JObj *)a->elem[i];
             const char *t = cand_text(c);
             if (!t || !*t) continue;
             snprintf(g_ct[g_ct_n], sizeof g_ct[0], "%s", t);
             JField *idf = obj_get(c, "id");
-            g_cid[g_ct_n] = (idf && idf->val) ? (JBytes *)idf->val : NULL;
+            JBytes *idb = (idf && idf->type == 'o' && idf->val &&
+                           ((JBytes *)idf->val)->magic == JB_MAGIC) ? (JBytes *)idf->val : NULL;
+            if (idb && idb->len > 0 && idb->len <= (1L << 20) &&
+                (g_cid_buf[g_ct_n] = malloc(idb->len)) != NULL) {
+                memcpy(g_cid_buf[g_ct_n], idb->data, (size_t)idb->len);
+                g_cid_obj[g_ct_n].data = g_cid_buf[g_ct_n];
+                g_cid_obj[g_ct_n].len = idb->len;
+                g_cid[g_ct_n] = &g_cid_obj[g_ct_n];
+            }
             JField *cf = obj_get(c, "cover_input_len");
             g_ccover[g_ct_n] = (cf && cf->type == 'i') ? (int)(long)cf->val : 0;
             g_ct_n++;
         }
-        if (a->len < 10 || g_ct_n == before) break;
+    }
+    /* 释放本轮对象。若各批间出现重复指针（引擎在 iterator 里缓存了对象），
+     * 放弃显式释放，交给宽限期回收，避免释放引擎仍持有的对象。 */
+    {
+        void *seen[MAX_CAND + MAX_CAND / 10];
+        int ns = 0, dup = 0;
+        for (int b = 0; b < nb && !dup; b++) {
+            JArr *a = batches[b];
+            for (int k = 0; k <= a->len; k++) {
+                void *p = k == a->len ? (void *)a : a->elem[k];
+                for (int j = 0; j < ns; j++) if (seen[j] == p) { dup = 1; break; }
+                if (dup) break;
+                if (ns < (int)(sizeof seen / sizeof seen[0])) seen[ns++] = p;
+            }
+        }
+        if (!dup) {
+            for (int b = 0; b < nb; b++) {
+                JArr *a = batches[b];
+                for (int i = 0; i < a->len; i++) {
+                    JObj *c = (JObj *)a->elem[i];
+                    if (!is_jobj(c)) continue;
+                    JField *idf = obj_get(c, "id");
+                    if (idf && idf->type == 'o' && idf->val) reg_release((void *)idf->val);
+                    reg_release(c);
+                }
+                reg_release(a);
+            }
+        } else {
+            fprintf(stderr, "[daemon] candidate objects reused across pages; deferring to GC\n");
+        }
     }
     /* 旧 iterator 归还引擎 */
     if (g_cur_it && g_cur_it != it && sym_dci)
@@ -806,6 +1035,15 @@ static int cmd_next_is_batch(void) {
 
 /* ---------- daemon 主循环 ---------- */
 static void run_daemon(void *h, long sid) {
+    {   /* 回收配置：宽限期、开关、诊断；daemon 启动前的登记项永不回收 */
+        const char *e;
+        if ((e = getenv("WETYPE_GC_MS")) && *e) g_gc_grace_ms = atol(e);
+        if ((e = getenv("WETYPE_GC_OFF")) && *e && strcmp(e, "0")) g_gc_off = 1;
+        if ((e = getenv("WETYPE_GC_DEBUG")) && *e && strcmp(e, "0")) g_gc_debug = 1;
+        pthread_mutex_lock(&g_reg_mu);
+        g_reg_keep_from = g_regn;
+        pthread_mutex_unlock(&g_reg_mu);
+    }
     void *sym_pi  = dlsym(h, "_Z13process_inputP7_JNIEnvP8_jobjectlP8_jstringP11_jbyteArray");
     void *sym_cg  = dlsym(h, "_Z15candidate_get_nP7_JNIEnvP8_jobjectli");
     void *sym_sc  = dlsym(h, "_Z16select_candidateP7_JNIEnvP8_jobjectlP8_jstringP11_jbyteArrayS4_S6_P13_jobjectArrayS2_");
@@ -814,6 +1052,15 @@ static void run_daemon(void *h, long sid) {
     void *sym_asl = dlsym(h, "wxime_add_session_listener");
     void *sym_dci = dlsym(h, "_Z17delete_candidate_iteratorP7_JNIEnvP8_jobjectl");
     if (!sym_dci) sym_dci = dlsym(h, "delete_candidate_iterator");
+    /* 引擎自带的会话垃圾回收：真机 App 会周期调用；不调制每次搜索泄漏 ~1.2MB */
+    void *(*sym_gc)(void *, void *) = (void *(*)(void *, void *))dlsym(h, "_Z11gc_sessionsP7_JNIEnvP8_jobject");
+    if (!sym_gc) sym_gc = (void *(*)(void *, void *))dlsym(h, "gc_sessions");
+    static int gc_every = -1;   /* 每 N 次请求调一次 gc_sessions，0=每次，-1 默认 1 */
+    if (gc_every < 0) {
+        const char *e = getenv("WETYPE_GC_SESSIONS_EVERY");
+        gc_every = e ? atoi(e) : 1;
+    }
+    long since_gc = 0;
 
     char line[512];
     char sent[256] = "";    /* C 以来发送的字母，用于识别当前输入的候选 */
@@ -829,6 +1076,33 @@ static void run_daemon(void *h, long sid) {
                 line[0], L, sid);
         if (!strcmp(line, "Q")) break;
         if (!strcmp(line, "PING")) { proto_printf("PONG\n"); fflush(NULL); fprintf(stderr, "[daemon] -> PONG\n"); continue; }
+        /* X <name>：调试用，直接调引擎导出函数（看哪个能回收内存）。
+         * 支持的无参/单参形式：gc_sessions、read_and_clean_last_emit_log、warm_up_dict、
+         * reset_user_dict、enrich_user_dict、clear_cell_dicts、warm_up_session(sid)、
+         * reset_session(sid)、has_session(sid) */
+        if (line[0] == 'X' && line[1] == ' ') {
+            const char *name = line + 2;
+            void *fn = dlsym(h, name);
+            if (!fn) {
+                char m1[256], m2[256], m3[256];
+                snprintf(m1, sizeof m1, "_Z%zu%sP7_JNIEnvP8_jobject", strlen(name), name);
+                snprintf(m2, sizeof m2, "_Z%zu%sP7_JNIEnvP7_jclass", strlen(name), name);
+                snprintf(m3, sizeof m3, "_Z%zu%sP7_JNIEnvP8_jobjectl", strlen(name), name);
+                fn = dlsym(h, m1);
+                if (!fn) fn = dlsym(h, m2);
+                if (!fn) fn = dlsym(h, m3);
+            }
+            long r = -1;
+            if (fn) {
+                if (strstr(name, "session")) r = ((long (*)(void *, void *, long))fn)(g_env, NULL, sid);
+                else if (strstr(name, "enrich")) r = ((long (*)(void *, void *, int))fn)(g_env, NULL, 0);
+                else r = ((long (*)(void *, void *))fn)(g_env, NULL);
+            }
+            fprintf(stderr, "[daemon] X %s -> %ld (fn=%p)\n", name, r, fn);
+            proto_printf("OK\t%ld\n", r);
+            fflush(NULL);
+            continue;
+        }
         if (!strcmp(line, "OPT spans")) { spans = 1; proto_printf("OK\n"); fflush(NULL); continue; }
         if (!strcmp(line, "SAVE")) { proto_printf("OK\n"); fflush(NULL); continue; }  /* 选词时引擎已落盘 */
         if ((line[0] == 'L' || line[0] == 'B') && line[1] == ' ') {
@@ -852,6 +1126,7 @@ static void run_daemon(void *h, long sid) {
                 proto_printf("EMPTY\n"); fflush(NULL); continue;
             }
             daemon_drop_events(sym_dci);
+            reg_sweep();   /* 安全点：回收宽限期外的假 JNI 对象 */
             for (const char *p = keys; *p; ++p) {
                 char key[2] = {*p, '\0'};
                 daemon_key(sym_pi, sid, 'd', key);
@@ -868,6 +1143,10 @@ static void run_daemon(void *h, long sid) {
                     strlen(keys), sent_n, g_cand_callback_count, exact, it, got);
             for (int i = 0; i < skipped; i++) proto_printf("SKIP\n");
             daemon_reply_cands(got, spans);
+            if (sym_gc && gc_every && ++since_gc >= gc_every) {
+                sym_gc(g_env, NULL);   /* 安全点：回收引擎内部会话垃圾 */
+                since_gc = 0;
+            }
             continue;
         }
         /* S <rank> 选词。spans 模式下若候选只覆盖前缀，引擎保留剩余拼音并重新搜索：
@@ -881,6 +1160,7 @@ static void run_daemon(void *h, long sid) {
             const int cover = g_ccover[idx];
             const int partial = spans && sent_known && cover > 0 && (size_t)cover < sent_n;
             daemon_drop_events(sym_dci);
+            reg_sweep();
             ((void (*)(void *, void *, long, void *, void *, void *, void *, void *, void *, void *))sym_sc)
                 (g_env, NULL, sid, &sel, g_cid[idx], NULL, NULL, NULL, NULL, NULL);
             if (!partial) {
@@ -902,12 +1182,16 @@ static void run_daemon(void *h, long sid) {
         if (!strcmp(line, "C") && sym_cs && sym_ds) {      /* C 清空输入（重建会话） */
             fprintf(stderr, "[daemon] reset begin old_session=%ld iterator=%#lx\n", sid, g_cur_it);
             daemon_drop_events(sym_dci);
+            reg_sweep();   /* 安全点：清空输入后回收全部临时对象 */
+            cid_copies_clear();
+            g_ct_n = 0;
             if (g_cur_it && sym_dci) { ((void (*)(void *, void *, long))sym_dci)(g_env, NULL, g_cur_it); g_cur_it = 0; }
             ((void (*)(void *, void *, long))sym_ds)(g_env, NULL, sid);
             sid = daemon_new_session(sym_cs, sym_asl);
             g_ct_n = 0; g_last_iterator = 0;
             sent_n = 0; sent[0] = 0; sent_known = 1;
             fprintf(stderr, "[daemon] reset end new_session=%ld\n", sid);
+            since_gc = 0;
             proto_printf("OK\n");
             fflush(NULL);
             continue;
@@ -916,6 +1200,7 @@ static void run_daemon(void *h, long sid) {
         fflush(NULL);
     }
     if (g_cur_it && sym_dci) ((void (*)(void *, void *, long))sym_dci)(g_env, NULL, g_cur_it);
+    cid_copies_clear();
     if (sid > 0 && sym_ds) {   /* 销毁会话促使引擎落盘用户词库 */
         ((void (*)(void *, void *, long))sym_ds)(g_env, NULL, sid);
         usleep(300000);
