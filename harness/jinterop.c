@@ -583,10 +583,14 @@ static void *F_NewLocalRef(void *env, void *o) { return o; }
 static void *F_ExceptionOccurred(void *env) { return NULL; }
 static void F_ExceptionClear(void *env) { }
 static unsigned char F_ExceptionCheck(void *env) { return 0; }
-/* 静态 void 回调（WxhldApi.onBatchEvent / onReportEngineException）：候选由 harness
-   自己的 native 监听器接收，这里空实现；不读参数，可同时挂 ...、V、A 三种变体。 */
+/* 候选由胶水已注册的 JNI listener 推送；字段钩子捕获 iterator 后，
+ * onBatchEvent 才是交付完成的通知。不要再注册 native 探针 listener：
+ * 每个 listener 都会获得一个独立的、必须归还的 native iterator。
+ * 不读 Java 参数，可同时挂 ...、V、A 三种变体。 */
 static void F_CallStaticVoidMethod(void *env, void *cls, JIDToken *id, ...) {
     LOG("CallStaticVoidMethod(%s.%s)\n", cls_name(cls), id ? id->name : "?");
+    if (g_daemon_mode && id && !strcmp(id->name, "onBatchEvent"))
+        probe_listener(0, 0, 0, 0);
 }
 /* 伪 JavaVM：JNI_OnLoad 会调 GetEnv（槽 6，双重间接同 JNIEnv） */
 static void *g_env;            /* 前向声明：定义在 env 布表区 */
@@ -967,12 +971,9 @@ static void daemon_key(void *sym_pi, long sid, char op, const char *payload) {
     ((int (*)(void *, void *, long, void *, void *))sym_pi)(g_env, NULL, sid, &in, NULL);
 }
 
-/* 新建会话并挂探针 */
-static long daemon_new_session(void *sym_cs, void *sym_asl) {
-    long sid = ((long (*)(void *, void *, void *))sym_cs)(g_env, NULL, &g_sesscfg);
-    if (sid > 0 && sym_asl)
-        ((void (*)(long, void *, void *))sym_asl)(sid, (void *)probe_listener, (void *)0x1234);
-    return sid;
+/* create_session 已注册 JNI listener，daemon 不需要额外的 native 探针。 */
+static long daemon_new_session(void *sym_cs) {
+    return ((long (*)(void *, void *, void *))sym_cs)(g_env, NULL, &g_sesscfg);
 }
 
 /* 回复候选行。spans 模式下每项为 "<覆盖字母数>:<文本>"，供前端部分选词。 */
@@ -1049,10 +1050,14 @@ static void run_daemon(void *h, long sid) {
     void *sym_sc  = dlsym(h, "_Z16select_candidateP7_JNIEnvP8_jobjectlP8_jstringP11_jbyteArrayS4_S6_P13_jobjectArrayS2_");
     void *sym_cs  = dlsym(h, "_Z14create_sessionP7_JNIEnvP8_jobjectS2_");
     void *sym_ds  = dlsym(h, "_Z15destroy_sessionP7_JNIEnvP8_jobjectl");
-    void *sym_asl = dlsym(h, "wxime_add_session_listener");
-    void *sym_dci = dlsym(h, "_Z17delete_candidate_iteratorP7_JNIEnvP8_jobjectl");
+    /* Itanium ABI 的长度是 25，不是 17；空 deleter 会使整个惰性搜索图滞留。 */
+    void *sym_dci = dlsym(h, "_Z25delete_candidate_iteratorP7_JNIEnvP8_jobjectl");
     if (!sym_dci) sym_dci = dlsym(h, "delete_candidate_iterator");
-    /* 引擎自带的会话垃圾回收：真机 App 会周期调用；不调制每次搜索泄漏 ~1.2MB */
+    if (!sym_dci) {
+        fprintf(stderr, "[daemon] required delete_candidate_iterator NOT FOUND; refusing to leak native iterators\n");
+        _exit(1);
+    }
+    /* 会话 TTL 管理不是 iterator 析构；iterator 必须单独归还引擎。 */
     void *(*sym_gc)(void *, void *) = (void *(*)(void *, void *))dlsym(h, "_Z11gc_sessionsP7_JNIEnvP8_jobject");
     if (!sym_gc) sym_gc = (void *(*)(void *, void *))dlsym(h, "gc_sessions");
     static int gc_every = -1;   /* 每 N 次请求调一次 gc_sessions，0=每次，-1 默认 1 */
@@ -1187,7 +1192,7 @@ static void run_daemon(void *h, long sid) {
             g_ct_n = 0;
             if (g_cur_it && sym_dci) { ((void (*)(void *, void *, long))sym_dci)(g_env, NULL, g_cur_it); g_cur_it = 0; }
             ((void (*)(void *, void *, long))sym_ds)(g_env, NULL, sid);
-            sid = daemon_new_session(sym_cs, sym_asl);
+            sid = daemon_new_session(sym_cs);
             g_ct_n = 0; g_last_iterator = 0;
             sent_n = 0; sent[0] = 0; sent_known = 1;
             fprintf(stderr, "[daemon] reset end new_session=%ld\n", sid);
@@ -1382,16 +1387,16 @@ int main(int argc, char **argv) {
         printf("create_session -> %ld\n", sid);
         fflush(stdout);
 
-        /* 注册我们自己的 native 监听器：抓引擎回调参数（iterator 应在此） */
+        /* 非 daemon 的一次性探针保留；daemon 只承接 JNI onBatchEvent。 */
         void *sym_asl = dlsym(h, "wxime_add_session_listener");
         if (!sym_asl) sym_asl = dlsym(h, "_Z24wxime_add_session_listenerlPFvPvS_iiES_");
-        if (sym_asl) {
+        if (sym_asl && !g_daemon_mode) {
             printf("registering probe listener on session %ld...\n", sid);
             fflush(stdout);
             ((void (*)(long, void *, void *))sym_asl)(sid, (void *)probe_listener, (void *)0x1234);
             printf("probe listener registered\n");
             fflush(stdout);
-        } else {
+        } else if (!g_daemon_mode) {
             printf("wxime_add_session_listener NOT FOUND\n");
         }
 

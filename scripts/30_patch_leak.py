@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
-"""30_patch_leak.py — libwxhld.so 每搜索 ~1.2MB 泄漏：补丁生成器（研究版）。
+"""30_patch_leak.py — 历史泄漏补丁实验（不安全，默认拒绝生成）。
 
-★ 结论先行：本仓库验证表明该泄漏【无法在不破坏正确性的前提下二进制补丁】，
-  本脚本默认拒绝打补丁（--accept-risk 显式确认才生成）。
-  两个已实现并实测的策略均会破坏引擎（数据见本文件"实验记录"与最终报告）：
-  · free  策略：代际隔离后裸 operator delete 泄漏簇 → 第 10 次搜索挂死
-               （watchdog：簇被引擎后续异步路径重新遍历/恢复）。
-  · drain 策略：替引擎排空被遗弃的 fifo_scheduler 队列 → 第 2 次搜索 SIGSEGV
-               （排入的任务捕获了搜索瞬态对象，晚执行=use-after-free）。
+★ 已找到无 ELF 补丁的修复：harness/jinterop.c 恢复 iterator 所有权。
+  真实 JNI 析构导出是 _Z25delete_candidate_iteratorP7_JNIEnvP8_jobjectl，
+  旧 harness 错写成 _Z17；额外 native 探针 listener 又获得未归还的第二份
+  iterator。daemon 改由 JNI onBatchEvent 通知，正确归还唯一 listener 的
+  iterator 即可调用引擎自身析构，释放惰性协程图。证据/复测见
+  docs/engine-iterator-leak.md、scripts/test_iterator_ownership.py。
 
-根因（详见报告）：每次搜索异步任务图（协程帧+闭包簇，~1.2MB）滞留：
-  · 堆引用图扫描（mtrace2_heapscan）：簇外无引用（libwxhld 全局段+全堆均无），
-    根闭包悬空 —— 由挂起的协程栈/队列持有；
-  · 引擎自带析构（0xb8bce0/0xb8e260/…）从不执行（39600B 块计数线性增长、
-    永不释放）；gc_sessions/reset_cloud_svr_cache 等 6 个 API 实测均不回收；
-  · 每搜索 2-3 个 72B fifo_scheduler impl（0x1f7ad60 分配）连同其任务队列
-    被遗弃：任务永不执行 → future 永不兑现 → 协程永不 final_suspend。
+以下 blob 仅保留用于历史实验复现，--accept-risk 不代表可部署：
+  · free：裸释放破坏所有权；第 10 次搜索挂死。还存在未登记 delete 被吞、
+    未保存 x21 等蹦床缺陷，不能仅凭这个实验断言引擎 TTL 重访已释放簇。
+  · drain：漏重放 gc_sessions 的 stp x29,x30,[sp,#-0x30]!，首次 gc 返回
+    即破坏栈，ASCII fault 不是捕获瞬态对象 UAF 的证据。ABI 修正对照在
+    GC_OFF 下 12 轮无崩溃但仍泄漏；精确分配记账显示 fifo@0x1f7ad60
+    从未分配。原“遗弃 fifo 导致任务不执行”解释已被证伪。
 
-本脚本价值：可复现实验基座。--strategy free|drain --accept-risk 生成补丁 so，
-配合 scripts/drive_mtrace.py / mtrace2_heapscan.c 复测两条路线的失败方式。
+这些失败不等于“不可修”；不要使用这两个研究补丁作为修复。
 
 用法：
   python3 30_patch_leak.py                     # 打印结论并退出(2)
@@ -55,13 +53,13 @@ ORIG_GC_FIRST = bytes.fromhex("fd7bbda9")   # stp x29,x30,[sp,#-0x30]!
 # 由 NDK clang -Ttext=0x2330000 固定地址汇编）。占位 mov x9,#0x5A5A
 # 会被本脚本改写为 b 0x90a770。
 STRATEGIES = {
-    # 排空遗弃 fifo：挂 gc 排空上一代以前队列；impl 不释放。
-    # 实测：第 2 次搜索 SIGSEGV（任务捕获搜索瞬态对象）。
+    # 历史 drain 实验：蹦床漏重放原始栈帧指令，会破坏 gc 返回。
+    # 精确记账证伪了 fifo 遗弃假说；不得部署。
     "drain": dict(blob_len=0x258, off_alloc=0x0, off_free=0xC4,
                   off_gc=0x15C, off_b_gc=0x240, b64="/Xu/qfNTv6nzAx6qEPz/kBG+QPkgAj/W9AMAqtQEALQK//8Qa0ag0ksBC8sMAACQjCEJkS0AgNKOhUD4zgELi38CDuuAAABUrQUA8WH//1QZAAAUKf7/8C/934jvfWDTiv5E0+oDCiopNo9S6cazckp9CRtKMUDTK/7/8GsFQJENBYDSbBEKi45Bf8gOAQC03wUA8cAAAFRKBQCRSjFA060FAPGAAABU9///F5Q9Mcix/v814AMUqvNTwaj9e8GowANf1v17vqnzCwD5IAQAtPADAKoK/ETT6gMKKik2j1LpxrNySn0JG0oxQNMr/v/wawVAkQ8FgNIOAIDSbBEKi41Nf8htAQC0vwEQ66EAAFQtAIDSjU0xyDH//zUuAIDSSgUAkUoxQNPvBQDxgf7/VK4AALTgAxCqEvz/kFKmQPlAAj/W8wtA+f17wqjAA1/W8wtA+f17wqjAA1/W/Xu5qeAHAanzUwKp9VsDqfdjBKn5awWp+3MGqVb0/xBpRqDS1gIJyyn+//A0/d+IlAYAETT9n4ifCgBxYwQAVJUGAFEz/v/wcyIAkTf+//D3BkCRGACE0vsEAFh7AxaL4gJA+V8EAPGpAgBU4wZA+WT8YNOfABVrKAIAVGICAPkFAIDS4AMTqmADP9aAAAA0pQQAkb8ACPFj//9U4wZA+WT8YNMGAYDShgIGS58ABmtoAABUJgCA0ub+n8j3QgCRGAcA8eH8/1T7c0ap+WtFqfdjRKn1W0Op81NCqeAHQan9e8eoSUuL0h8gA9VgrfcBAAAAANiw9wEAAAAA"),
     # 代际裸释放 7 个泄漏调用点（0xb386cc/0xe92024/0xb3c394/0xb59b0c/
     # 0xb8ba14/0x9a9fd0/0x2139b88），延迟 8 代。
-    # 实测：第 10 次搜索 watchdog 挂死（簇被后续异步路径重访）。
+    # 实测第 10 次搜索挂死；蹦床亦存在 delete 透传/寄存器保存缺陷。
     "free": dict(blob_len=0x220, off_alloc=0x0, off_free=0xC4,
                  off_gc=0x15C, off_b_gc=0x1E0, b64="/Xu/qfNTv6nzAx6qEPz/kBG+QPkgAj/W9AMAqtQEALQK//8Qa0ag0ksBC8sMAACQjKEHke0AgNKOhUD4zgELi38CDuuAAABUrQUA8WH//1QZAAAUKf7/8C/934jvfWDTiv5E0+oDCiopNo9S6cazckp9CRtKMUDTK/7/8GsFQJENBYDSbBEKi45Bf8gOAQC03wUA8cAAAFRKBQCRSjFA060FAPGAAABU9///F5Q9Mcix/v814AMUqvNTwaj9e8GowANf1v17vqnzCwD5IAQAtPADAKoK/ETT6gMKKik2j1LpxrNySn0JG0oxQNMr/v/wawVAkQ8FgNIOAIDSbBEKi41Nf8htAQC0vwEQ66EAAFQtAIDSjU0xyDH//zUuAIDSSgUAkUoxQNPvBQDxgf7/VK4AALTgAxCqEvz/kFKmQPlAAj/W8wtA+f17wqjAA1/W8wtA+f17wqjAA1/W/Xu9qeAHAanzUwKpKf7/8Cr934hKBQARKv2fiF8lAHGjAgBUVCEAUTP+//BzBkCRFQCE0mIOf8hfBADxaQEAVGT8YNOfABRrCAEAVCYAgNJmDiXIpQAANeADAqoQ/P+QEaZA+SACP9ZzQgCRtQYA8SH+/1TzU0Kp4AdBqf17w6j9e72pSUuL0h8gA9XMhrMAAAAAACQg6QAAAAAAlMOzAAAAAAAMm7UAAAAAABS6uAAAAAAA0J+aAAAAAACImxMCAAAAAA=="),
 }
