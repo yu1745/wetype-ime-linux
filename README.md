@@ -118,6 +118,8 @@ ARM64 主机上加 `--native`（不经 QEMU；回归使用临时拷贝并用 `pa
 
 此回归覆盖候选、部分选词、学习、重置、长空闲恢复及重启持久化。插件及词表解析测试使用 `cmake -S fcitx5-wetype -B build && cmake --build build && ctest --test-dir build --output-on-failure`。
 
+需要验证**真实候选窗绘制与应用上屏**时，可在无头主机上运行 Xvfb + GTK3 的 [视觉 E2E](docs/visual-e2e.md)：`LIB=/path/to/libfcitx5-wetype.so WETYPE_ENGINE_DIR=/path/to/arm64 bash fcitx5-wetype/e2e/run_visual_e2e.sh`。测试会保存候选窗、翻页与上屏截图，不需要完整桌面环境。
+
 ## 可选候选英文释义
 
 将 UTF-8 词表放到 `~/.local/share/wetype-ime/glossary-en.tsv`，设置了 `XDG_DATA_HOME` 时则放到 `$XDG_DATA_HOME/wetype-ime/glossary-en.tsv`。重启 Fcitx5 后加载，无网络请求。词表格式为 `中文词<TAB>[词性. ]英文释义`，例如：
