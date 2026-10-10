@@ -106,7 +106,7 @@ scripts/prepare_assets.sh    # 下载并校验 APK 到 .deps/
 scripts/10_patch_libs.sh     # 拷贝 APK 中的引擎库并打补丁，输出到 runtime/
 ```
 
-插件日志默认写入 `/tmp/wetype-harness.log`。
+插件日志默认写入 `$XDG_STATE_HOME/wetype-ime/harness.log`（未设置时 `~/.local/state/wetype-ime/harness.log`），超过 16 MiB 自动轮转为 `.1`；设 `WETYPE_HARNESS_LOG` 可改到别处（如 `/dev/null` 关闭日志）。
 
 可无桌面验证已安装的引擎（使用临时学习目录，不修改实际用户词库）：
 

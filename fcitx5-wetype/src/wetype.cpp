@@ -46,6 +46,7 @@
 #include <unordered_set>
 
 #include "glossary.h"
+#include "harness_log.h"
 #include "punctuation.h"
 
 namespace fcitx {
@@ -174,6 +175,18 @@ static void resolveDirs(std::string &eng, std::string &dicts, std::string &work,
     work = getenv("WETYPE_WORK_DIR") ? getenv("WETYPE_WORK_DIR") : base + "/wetype-ime/dict";
 }
 
+// ---------------------------------------------------------------- 引擎日志
+// 解析、建目录与轮转都在父进程做完(纯逻辑见 harness_log.h), 好让 fork 之后、
+// exec 之前只剩一次 open: 那段窗口里不做分配, 也不做 stat。
+static std::string prepareHarnessLog() {
+    std::string path = wetype::harnessLogPath(getenv("WETYPE_HARNESS_LOG"),
+                                              getenv("XDG_STATE_HOME"), getenv("HOME"));
+    const std::size_t slash = path.rfind('/');
+    if (slash != std::string::npos) wetype::mkdirParents(path.substr(0, slash));
+    wetype::capHarnessLog(path);
+    return path;
+}
+
 // ---------------------------------------------------------------- 异步引擎进程
 class EngineProc {
 public:
@@ -197,6 +210,8 @@ public:
         }
         std::string eng, dicts, work, qemu, sysroot;
         resolveDirs(eng, dicts, work, qemu, sysroot);
+        // 路径解析与轮转都在父进程做完, 子进程只保留一次 open。
+        const std::string harnessLog = prepareHarnessLog();
 
         int inP[2], outP[2];
         if (pipe2(inP, O_CLOEXEC) < 0) return false;
@@ -221,9 +236,7 @@ public:
             close(inP[1]);
             close(outP[0]);
             close(outP[1]);
-            const char *logPath = getenv("WETYPE_HARNESS_LOG");
-            if (!logPath || !*logPath) logPath = "/tmp/wetype-harness.log";
-            int logFd = open(logPath, O_WRONLY | O_CREAT | O_APPEND, 0600);
+            int logFd = open(harnessLog.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
             if (logFd >= 0) { dup2(logFd, 2); close(logFd); }
             std::string libPath = eng + "/lib";
             // Native run: bionic libc/liblog/libc++ come from the bundled sysroot.
